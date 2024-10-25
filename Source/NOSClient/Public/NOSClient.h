@@ -286,8 +286,9 @@ class NOSConsoleOutput : public FOutputDevice
 {
 public:
 	FNOSClient* NOSClient;
-	NOSConsoleOutput(FNOSClient* NOSClient)
-		: FOutputDevice(), NOSClient(NOSClient)
+	const TCHAR* Input = nullptr;
+	NOSConsoleOutput(FNOSClient* NOSClient, const TCHAR* input)
+		: FOutputDevice(), NOSClient(NOSClient), Input(input)
 	{
 	}
 
@@ -299,7 +300,7 @@ public:
 		}
 		
 		flatbuffers::FlatBufferBuilder mb;
-		auto offset = nos::CreateAppEventOffset(mb ,nos::app::CreateConsoleOutputDirect(mb, TCHAR_TO_UTF8(V)));
+		auto offset = nos::CreateAppEventOffset(mb ,nos::app::CreateConsoleOutputDirect(mb, TCHAR_TO_UTF8(V), Input ? TCHAR_TO_UTF8(Input) : nullptr));
 		mb.Finish(offset);
 		auto buf = mb.Release();
 		auto root = flatbuffers::GetRoot<nos::app::AppEvent>(buf.data());
