@@ -253,7 +253,7 @@ public:
 
 	virtual void SetArrayPropValues(void* val, size_t size, FScriptArrayHelper_InContainer& ArrayHelper) override
 	{
-		auto vec = (flatbuffers::Vector<u8>*)val; 
+		auto vec = (flatbuffers::Vector<uint8_t>*)val; 
 		int ct = vec->size();
 		ArrayHelper.Resize(ct);
 		for(int i = 0; i < ct; i++)
@@ -446,7 +446,7 @@ public:
 
 	virtual void SetArrayPropValues(void* val, size_t size, FScriptArrayHelper_InContainer& ArrayHelper) override
 	{
-		auto vec = (flatbuffers::Vector<u8>*)val; 
+		auto vec = (flatbuffers::Vector<uint8_t>*)val;
 		int ct = vec->size();
 		ArrayHelper.Resize(ct);
 		for(int i = 0; i < ct; i++)
