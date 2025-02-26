@@ -19,6 +19,8 @@
 #include "HardwareInfo.h"
 #include "LevelSequence.h"
 #include "PacketHandler.h"
+#include "UObject/ObjectSaveContext.h"
+#include "Blueprint/UserWidget.h"
 
 DEFINE_LOG_CATEGORY(LogNOSSceneTreeManager);
 #define LOG(x) UE_LOG(LogNOSSceneTreeManager, Display, TEXT(x))
@@ -552,6 +554,7 @@ void FNOSSceneTreeManager::LoadNodesOnPath(FString NodePath)
 bool IsActorDisplayable(const AActor* Actor)
 {
 	static const FName SequencerActorTag(TEXT("SequencerActor"));
+	static const FName ZDActorTag(TEXT("ZDActor"));
 
 	if(Actor == nullptr)
 	{
@@ -565,6 +568,7 @@ bool IsActorDisplayable(const AActor* Actor)
 			(Actor->ActorHasTag(SequencerActorTag))) &&
 		!Actor->IsTemplate() &&																	// Should never happen, but we never want CDOs displayed
 		!Actor->IsA(AWorldSettings::StaticClass()) &&											// Don't show the WorldSettings actor, even though it is technically editable
+		Actor->ActorHasTag(ZDActorTag) &&
 		IsValidChecked(Actor);// &&																// We don't want to show actors that are about to go away
 		//!Actor->IsHidden();
 }
@@ -999,6 +1003,7 @@ void GetNodesWithProperty(const nos::fb::Node* node, std::vector<const nos::fb::
 
 void FNOSSceneTreeManager::OnActorSpawned(AActor* InActor)
 {
+	LOGF("%s is spawned.", *(InActor->GetFName().ToString()))
 	if (IsActorDisplayable(InActor))
 	{
 		SendActorAddedOnUpdate(InActor);
@@ -1022,13 +1027,13 @@ void FNOSSceneTreeManager::OnActorDestroyed(AActor* InActor)
 
 void FNOSSceneTreeManager::OnActorAttached(AActor* Actor, const AActor* ParentActor)
 {
-	LOG("Actor Attached");
+	
 	
 	if(!FNOSClient::NodeId.IsValid())
 	{
 		return;
 	}
-
+	LOGF("%s is attached.", *(Actor->GetFName().ToString()))
 	if(auto ActorNode = SceneTree.GetNodeFromActorId(Actor->GetActorGuid()))
 	{
 		if(auto OldParentActorNode = ActorNode->Parent->GetAsActorNode())
@@ -1052,13 +1057,12 @@ void FNOSSceneTreeManager::OnActorDetached(AActor* Actor, const AActor* ParentAc
 	if (!IsValid(daWorld))
 		return;
 
-	LOG("Actor Detached");
 	
 	if(!FNOSClient::NodeId.IsValid() || !daWorld->ContainsActor(Actor) || !IsValid(Actor) || Actor->IsPendingKillPending())
 	{
 		return;
 	}
-
+	LOGF("%s is detached.", *(Actor->GetFName().ToString()))
 	if(auto ActorNode = SceneTree.GetNodeFromActorId(Actor->GetActorGuid()))
 	{
 		auto parentFolder = SceneTree.GetFolderOrRoot(ActorNode);
@@ -1830,7 +1834,6 @@ bool FNOSSceneTreeManager::PopulateNode(FGuid nodeId)
 			ColoredChilds = true;
 		}
 		auto ActorClass = actorNode->actor->GetClass();
-
 		//ITERATE PROPERTIES BEGIN
 		class FProperty* AProperty = ActorClass->PropertyLink;
 		while (AProperty != nullptr)
@@ -1959,6 +1962,7 @@ bool FNOSSceneTreeManager::PopulateNode(FGuid nodeId)
 			// Exclude nested DSOs attached to BP-constructed instances, which are not mutable.
 			return (ActorComp != nullptr
 				&& (!ActorComp->IsVisualizationComponent())
+				&& (!ActorComp->IsA<UStaticMeshComponent>() && !ActorComp->ComponentHasTag(TEXT("ZDActor")))
 				&& (ActorComp->CreationMethod != EComponentCreationMethod::UserConstructionScript || !bHideConstructionScriptComponentsInDetailsView)
 				&& (ParentSceneComp == nullptr || !ParentSceneComp->IsCreatedByConstructionScript() || !ActorComp->HasAnyFlags(RF_DefaultSubObject)))
 				&& (ActorComp->CreationMethod != EComponentCreationMethod::Native || FComponentEditorUtils::GetPropertyForEditableNativeComponent(ActorComp));
@@ -2068,6 +2072,13 @@ bool FNOSSceneTreeManager::PopulateNode(FGuid nodeId)
 		auto Actor = Component->GetOwner();
 		auto ComponentNode = treeNode->GetAsSceneComponentNode();
 		auto ComponentClass = Component->GetClass();
+
+		//Skip if component is StaticMeshComponent
+		if (Component->IsA<UStaticMeshComponent>())
+		{
+			LOG("Skipping static mesh component");
+			return false;
+		}
 
 		for (FProperty* Property = ComponentClass->PropertyLink; Property; Property = Property->PropertyLinkNext)
 		{
