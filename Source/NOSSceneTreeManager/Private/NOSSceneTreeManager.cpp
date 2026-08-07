@@ -2865,6 +2865,11 @@ void FNOSSceneTreeManager::RemoveProperties(TreeNode* Node,
 	}
 	for (auto& child : Node->Children)
 	{
+		// Descend through component nodes only. Deleting an actor re-parents its child actors
+		// onto a folder rather than deleting them, so stripping their properties here would
+		// leave live actors with pins Nodos can no longer resolve.
+		if (child && child->GetAsActorNode())
+			continue;
 		RemoveProperties(child.Get(), PropertiesToRemove);
 	}
 }
