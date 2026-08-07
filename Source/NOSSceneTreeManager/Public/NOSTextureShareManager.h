@@ -15,6 +15,7 @@ void MemoryBarrier();
 #include <d3d12.h>
 #include "Windows/HideWindowsPlatformTypes.h"
 
+#include <atomic>
 #include <shared_mutex>
 
 #include "NOSActorProperties.h"
@@ -124,7 +125,9 @@ public:
 	TMap<FGuid, NOSProperty*> PendingCopyQueue;
 
 
-	uint64_t FrameCounter = 0;
+	// Written by the gRPC thread (SwitchStateToIdle_GRPCThread) and by the game thread
+	// (OnEndFrame, RenewSemaphores); read by the game thread and captured into render commands.
+	std::atomic<uint64_t> FrameCounter = 0;
 	ID3D12Fence* InputFence = nullptr;
 	ID3D12Fence* OutputFence= nullptr;
 
@@ -132,7 +135,9 @@ public:
 	
 	SyncSemaphoresExport SyncSemaphoresExportHandles;
 	
-	nos::app::ExecutionState ExecutionState = nos::app::ExecutionState::IDLE;
+	// Written by the gRPC thread and by the render thread, read by the render thread in
+	// SetupFences. CriticalSectionState only covers the two switch functions, not the reader.
+	std::atomic<nos::app::ExecutionState> ExecutionState = nos::app::ExecutionState::IDLE;
 	
 	void RenewSemaphores();
 private:

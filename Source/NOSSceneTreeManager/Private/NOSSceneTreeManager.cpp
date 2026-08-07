@@ -143,7 +143,7 @@ void FNOSSceneTreeManager::OnBeginFrame()
 void FNOSSceneTreeManager::OnEndFrame()
 {
 	NOSPropertyManager.OnEndFrame();
-	auto frameCount = NOSTextureShareManager::GetInstance()->FrameCounter;
+	auto frameCount = NOSTextureShareManager::GetInstance()->FrameCounter.load();
 	NOSTextureShareManager::GetInstance()->OnEndFrame();
 
 
@@ -3915,7 +3915,7 @@ void FNOSPropertyManager::OnBeginFrame()
 		else
 			DeltaSeconds = DEFAULT_DELTA_SECONDS;
 		constexpr float MAX_FRAME_WAIT_MULTIPLIER = 3.0f;
-		auto executeInfo = NOSClient->EventDelegates->ExecuteQueue.PopFrameNumber(NOSTextureShareManager::GetInstance()->FrameCounter, DeltaSeconds * MAX_FRAME_WAIT_MULTIPLIER);
+		auto executeInfo = NOSClient->EventDelegates->ExecuteQueue.PopFrameNumber(NOSTextureShareManager::GetInstance()->FrameCounter.load(), DeltaSeconds * MAX_FRAME_WAIT_MULTIPLIER);
 
 		for (auto& [id, val] : executeInfo.PinValueUpdates)
 		{

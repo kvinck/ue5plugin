@@ -378,7 +378,7 @@ void NOSTextureShareManager::ProcessCopies(nos::fb::ShowAs CopyShowAs)
 
 	//auto cmdData = GetNewCommandList();
 	ENQUEUE_RENDER_COMMAND(FNOSClient_CopyOnTick)(
-		[this, CopyShowAs, CopiesFiltered, frameNumber = FrameCounter](FRHICommandListImmediate& RHICmdList)
+		[this, CopyShowAs, CopiesFiltered, frameNumber = FrameCounter.load()](FRHICommandListImmediate& RHICmdList)
 		{
 #ifdef DEBUG_NODOS_TEXTURE_COPIES
 			SCOPED_CONDITIONAL_DRAW_EVENTF(RHICmdList, NodosCopies_Output, CopyShowAs == nos::fb::ShowAs::OUTPUT_PIN, TEXT("Nodos Copies(Output)"));
