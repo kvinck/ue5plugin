@@ -236,6 +236,12 @@ public class NOSClient : ModuleRules
 				PublicIncludePaths.Add(SDKIncludeDir);
 				PublicIncludePaths.Add(dirs?.VulkanSubsystemIncludeDir);
 
+				// nosDefines.h tests #if BUILDING_NODOS without defining it, which
+				// Unreal compiles as C4668 and treats as an error. Zero is what an
+				// undefined macro already evaluates to there, so this changes
+				// nothing but whether the build stops.
+				PublicDefinitions.Add("BUILDING_NODOS=0");
+
 				PublicDependencyModuleNames.AddRange(
 					new string[]
 					{
