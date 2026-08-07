@@ -141,6 +141,14 @@ public:
 	bool Tick(float dt);
 	bool CheckNewLevels(float dt);
 
+	// Queues every actor the last rescan found, to be populated over the coming
+	// frames rather than when something first asks for one.
+	void QueueBackgroundPopulate();
+	// Populates as many queued actors as fit in this frame's budget.
+	void TickBackgroundPopulate();
+	// Gathers the actors beneath a folder the scan produced.
+	void CollectActorsToPopulate(TreeNode* Node);
+
 	void OnBeginFrame();
 	void OnEndFrame();
 
@@ -364,6 +372,15 @@ public:
 	TSet<TWeakObjectPtr<ULevel>> AlreadyLoadedStreamingLevels;
 
 	TSet<FGuid> ActorsDeletedFromNodos;
+
+	// Actors whose properties and functions have not been built yet.
+	//
+	// Held by id rather than by pointer: an actor can be destroyed between being
+	// queued and being reached, and an id that no longer resolves is simply
+	// skipped.
+	TArray<FGuid> ActorsToBePopulated;
+	int32 BackgroundPopulateQueued = 0;
+	double BackgroundPopulateStartedAt = 0.0;
 
 	static TSet<FGuid> PropertiesNeeded;
 

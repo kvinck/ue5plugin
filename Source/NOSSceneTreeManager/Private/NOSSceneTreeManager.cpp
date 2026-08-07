@@ -458,7 +458,123 @@ bool FNOSSceneTreeManager::Tick(float dt)
 		NOSClient->UENodeStatusHandler.Remove("two_way_binding_status");
 		bTwoWayBindingStatusSent = false;
 	}
+
+	TickBackgroundPopulate();
 	return true;
+}
+
+// An actor's properties and functions are not built when the scene is scanned.
+// They are built the first time something asks for the actor - the editor
+// expanding it in the tree, or a LoadNodesOnPaths request - and building one
+// costs tens to hundreds of milliseconds, all inside a single frame. On a
+// renderer that is a visible hitch, and it lands whenever an operator first
+// touches a graphic, which is to say on air.
+//
+// Nothing about that work needs to wait for the asking. These two functions do
+// it up front instead, a few actors per frame, so the cost is paid in the
+// seconds after a level loads and every actor is ready before anyone reaches
+// for it.
+static TAutoConsoleVariable<int32> CVarBackgroundPopulate(
+	TEXT("Nodos.BackgroundPopulate"),
+	1,
+	TEXT("Build every actor's properties and functions over the frames after a level loads, ")
+	TEXT("rather than when something first asks for one. 0 restores the old behaviour."));
+
+// How long a frame may spend on this. One actor is atomic and can overrun it, so
+// this bounds how many are started, not the worst frame. Kept small because the
+// engine is rendering while it works.
+static TAutoConsoleVariable<float> CVarBackgroundPopulateMs(
+	TEXT("Nodos.BackgroundPopulateMsPerFrame"),
+	3.0f,
+	TEXT("Milliseconds per frame to spend building actors in the background."));
+
+void FNOSSceneTreeManager::QueueBackgroundPopulate()
+{
+	ActorsToBePopulated.Reset();
+	if (!CVarBackgroundPopulate.GetValueOnGameThread())
+		return;
+
+	for (auto& ChildNode : SceneTree.Root->Children)
+	{
+		CollectActorsToPopulate(ChildNode.Get());
+	}
+
+	BackgroundPopulateQueued = ActorsToBePopulated.Num();
+	BackgroundPopulateStartedAt = FPlatformTime::Seconds();
+	if (BackgroundPopulateQueued > 0)
+	{
+		UE_LOG(LogNOSSceneTreeManager, Display,
+			TEXT("Building %d actors in the background so nothing has to do it on air"),
+			BackgroundPopulateQueued);
+	}
+}
+
+// CollectActorsToPopulate walks the folders the scan produced, gathering the
+// actors beneath them.
+void FNOSSceneTreeManager::CollectActorsToPopulate(TreeNode* Node)
+{
+	if (!Node)
+		return;
+
+	if (Node->GetAsActorNode())
+	{
+		ActorsToBePopulated.Add(Node->Id);
+		return;
+	}
+	for (auto& ChildNode : Node->Children)
+	{
+		CollectActorsToPopulate(ChildNode.Get());
+	}
+}
+
+void FNOSSceneTreeManager::TickBackgroundPopulate()
+{
+	if (ActorsToBePopulated.IsEmpty())
+		return;
+	if (!CVarBackgroundPopulate.GetValueOnGameThread())
+	{
+		ActorsToBePopulated.Reset();
+		return;
+	}
+	// Nothing to send the updates to yet; the queue keeps until there is.
+	if (!NOSClient || !NOSClient->IsConnected())
+		return;
+
+	const double Budget = CVarBackgroundPopulateMs.GetValueOnGameThread() / 1000.0;
+	const double StartedAt = FPlatformTime::Seconds();
+
+	// One batch per frame, flushed the same way a LoadNodesOnPaths request is,
+	// so the engine sees the same events in the same order it would have.
+	FNodeUpdateBatch Batch;
+	int32 Built = 0;
+	while (!ActorsToBePopulated.IsEmpty() && FPlatformTime::Seconds() - StartedAt < Budget)
+	{
+		const FGuid NodeId = ActorsToBePopulated.Pop(EAllowShrinking::No);
+		if (auto* Node = SceneTree.GetNode(NodeId))
+		{
+			PopulateNodeAndDirectDescendants(Node, &Batch);
+			Built++;
+		}
+	}
+
+	if (!Batch.Events.empty())
+	{
+		auto batchOffset = nos::app::CreateBatchAppEventDirect(Batch.Builder, &Batch.Events);
+		auto appEventOffset = nos::CreateAppEventOffset(Batch.Builder, batchOffset);
+		Batch.Builder.Finish(appEventOffset);
+		auto buf = Batch.Builder.Release();
+		auto root = flatbuffers::GetRoot<nos::app::AppEvent>(buf.data());
+		NOSClient->AppServiceClient->Send(*root);
+	}
+
+	if (ActorsToBePopulated.IsEmpty() && BackgroundPopulateQueued > 0)
+	{
+		UE_LOG(LogNOSSceneTreeManager, Display,
+			TEXT("Built %d actors in the background in %.1f s; nothing is left to build on first use"),
+			BackgroundPopulateQueued, FPlatformTime::Seconds() - BackgroundPopulateStartedAt);
+		BackgroundPopulateQueued = 0;
+	}
+	(void)Built;
 }
 
 bool FNOSSceneTreeManager::CheckNewLevels(float dt)
@@ -1951,6 +2067,7 @@ void FNOSSceneTreeManager::RescanScene(bool reset)
 	// Kept at Display: it is once per level load, and it is the line that says
 	// how much of the scene Nodos can see.
 	UE_LOG(LogNOSSceneTreeManager, Display, TEXT("SceneTree is constructed."));
+	QueueBackgroundPopulate();
 }
 
 bool PropertyVisible(FProperty* ueproperty)
