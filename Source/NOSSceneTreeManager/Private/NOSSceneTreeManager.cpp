@@ -2248,7 +2248,7 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 
 			UClass* Class = ActorClass;
 
-			if (FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryName.ToString()) || !PropertyVisible(AProperty))
+			if (!PropertyVisible(AProperty) || FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryName.ToString()))
 			{
 				AProperty = AProperty->PropertyLinkNext;
 				continue;
@@ -2488,7 +2488,7 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 			FName CategoryName = FObjectEditorUtils::GetCategoryFName(Property);
 			UClass* Class = Component->GetClass();
 
-			if (FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryName.ToString()) || !PropertyVisible(Property))
+			if (!PropertyVisible(Property) || FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryName.ToString()))
 			{
 				continue;
 			}

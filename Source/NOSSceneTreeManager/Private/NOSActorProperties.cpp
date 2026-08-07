@@ -818,7 +818,7 @@ NOSStructProperty::NOSStructProperty(UObject* container, FStructProperty* uprope
 	{
 		FName CategoryNamek = FObjectEditorUtils::GetCategoryFName(AProperty);
 
-		if (Class && FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryNamek.ToString()) || !PropertyVisibleExp(AProperty))
+		if (!PropertyVisibleExp(AProperty) || (Class && FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryNamek.ToString())))
 		{
 			AProperty = AProperty->PropertyLinkNext;
 			continue;
@@ -1041,7 +1041,7 @@ NOSObjectProperty::NOSObjectProperty(UObject* container, FObjectProperty* uprope
 
 			UClass* Class = WidgetClass;
 
-			if (FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CCategoryName.ToString()) || !PropertyVisible(WProperty))
+			if (!PropertyVisible(WProperty) || FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CCategoryName.ToString()))
 			{
 				WProperty = WProperty->PropertyLinkNext;
 				continue;
