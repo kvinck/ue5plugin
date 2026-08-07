@@ -26,8 +26,15 @@
 #include "Blueprint/UserWidget.h"
 
 DEFINE_LOG_CATEGORY(LogNOSSceneTreeManager);
-#define LOG(x) UE_LOG(LogNOSSceneTreeManager, Display, TEXT(x))
-#define LOGF(x, y) UE_LOG(LogNOSSceneTreeManager, Display, TEXT(x), y)
+// Verbose rather than Display: these fire once per node and once per property,
+// which is eleven and a half thousand lines while a project's actors are built.
+// Unreal writes each one to disk as it happens, so on a large scene the logging
+// is a measurable part of the cost of building the tree at all.
+//
+// Nothing is lost - `log LogNOSSceneTreeManager Verbose` brings them all back
+// when something needs tracing.
+#define LOG(x) UE_LOG(LogNOSSceneTreeManager, Verbose, TEXT(x))
+#define LOGF(x, y) UE_LOG(LogNOSSceneTreeManager, Verbose, TEXT(x), y)
 
 
 IMPLEMENT_MODULE(FNOSSceneTreeManager, NOSSceneTreeManager)
@@ -1941,7 +1948,9 @@ void FNOSSceneTreeManager::RescanScene(bool reset)
 #ifdef VIEWPORT_TEXTURE
 	ConnectViewportTexture();
 #endif
-	LOG("SceneTree is constructed.");
+	// Kept at Display: it is once per level load, and it is the line that says
+	// how much of the scene Nodos can see.
+	UE_LOG(LogNOSSceneTreeManager, Display, TEXT("SceneTree is constructed."));
 }
 
 bool PropertyVisible(FProperty* ueproperty)
@@ -2134,7 +2143,7 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 						
 						NosProp->nosMetaDataMap.Add(NosMetadataKeys::EditConditionPropertyId, UEIdToNOSIDString(prop->Id));
 						
-						UE_LOG(LogNOSSceneTreeManager, Warning, TEXT("%s has edit condition named %s with pind id %s"), *NosProp->DisplayName, *prop->DisplayName,
+						UE_LOG(LogNOSSceneTreeManager, Verbose, TEXT("%s has edit condition named %s with pind id %s"), *NosProp->DisplayName, *prop->DisplayName,
 							*NosProp->nosMetaDataMap[NosMetadataKeys::EditConditionPropertyId]);
 					}
 				}
@@ -2365,7 +2374,7 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 					if(prop->Property == NosProp->EditConditionProperty)
 					{
 						NosProp->nosMetaDataMap.Add(NosMetadataKeys::EditConditionPropertyId, UEIdToNOSIDString(prop->Id));
-						UE_LOG(LogNOSSceneTreeManager, Warning, TEXT("%s has edit condition named %s with pind id %s"), *NosProp->DisplayName, *prop->DisplayName,
+						UE_LOG(LogNOSSceneTreeManager, Verbose, TEXT("%s has edit condition named %s with pind id %s"), *NosProp->DisplayName, *prop->DisplayName,
 							*NosProp->nosMetaDataMap[NosMetadataKeys::EditConditionPropertyId]);
 					}
 				}
