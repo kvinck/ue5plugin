@@ -576,5 +576,10 @@ SharedResourceInfo::~SharedResourceInfo()
 	if (DstResource)
 	{
 		DstResource->ReleaseResource();
+		// Created with RF_MarkAsRootSet so the collector would leave it alone while Nodos held a
+		// handle to it. Releasing the RHI resource is not enough on its own - without this the
+		// UObject stays rooted for the life of the process, and a renderer that streams levels in
+		// and out all day accumulates one dead render target per retired destination.
+		DstResource->RemoveFromRoot();
 	}
 }
