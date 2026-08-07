@@ -43,6 +43,9 @@ struct NOSSCENETREEMANAGER_API  TreeNode : public TSharedFromThis<TreeNode> {
 struct NOSSCENETREEMANAGER_API  ActorNode : TreeNode
 {
 	NOSActorReference actor;
+	// The key this node was filed under in ActorIdToNodeId. Held separately because the actor
+	// reference is weak, and a node is often torn down after its actor has already gone.
+	FGuid RegisteredActorGuid;
 	std::vector<TSharedPtr<NOSProperty>> Properties;
 	std::vector<TSharedPtr<NOSFunction>> Functions;
 	virtual FString GetClassDisplayName() override { return actor ? actor->GetClass()->GetFName().ToString() : "Actor"; };
@@ -56,6 +59,9 @@ struct NOSSCENETREEMANAGER_API  ActorNode : TreeNode
 struct NOSSCENETREEMANAGER_API  SceneComponentNode : TreeNode
 {
 	NOSComponentReference sceneComponent;
+	// The key this node was filed under in SceneComponentToNodeMap. Only ever compared, never
+	// dereferenced - by removal time the component itself may already be collected.
+	USceneComponent* RegisteredComponentKey = nullptr;
 	std::vector<TSharedPtr<NOSProperty>> Properties;
 	virtual FString GetClassDisplayName() override { return sceneComponent ? sceneComponent->GetClass()->GetFName().ToString() : FString("ActorComponent"); };
 	virtual SceneComponentNode* GetAsSceneComponentNode() override { return this; };
@@ -92,6 +98,10 @@ public:
 	FGuid      GetNodeIdActorId(FGuid ActorId);
 	TreeNode* GetNode(FGuid NodeId);
 	void RemoveNode(FGuid NodeId);
+	// Unregisters Node and the component subtree beneath it from every lookup the tree keeps.
+	// Child actor nodes are left alone: deleting an actor re-parents them rather than removing
+	// them, so their registrations have to outlive their old parent.
+	void RemoveNodeAndDescendants(TreeNode* Node);
 	TreeNode* GetFolderOrRoot(TreeNode* node);
 
 	SceneComponentNode* GetSceneComponentNode(USceneComponent* SceneComponent);

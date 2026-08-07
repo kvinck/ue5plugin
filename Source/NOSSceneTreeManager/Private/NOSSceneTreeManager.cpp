@@ -2946,8 +2946,8 @@ void FNOSSceneTreeManager::SendActorNodeDeleted(ActorNode* node)
 		if (it != v.end())
 			v.erase(it);
 	}
-	//delete from map
-	SceneTree.RemoveNode(node->Id);
+	//delete from map, along with the component nodes underneath it
+	SceneTree.RemoveNodeAndDescendants(node);
 
 	if (!NOSClient->IsConnected())
 	{

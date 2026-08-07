@@ -157,7 +157,8 @@ TSharedPtr<ActorNode> NOSSceneTree::AddActor(FString folderPath, AActor* actor, 
 
 	TSharedPtr<ActorNode> newChild = CreateActorNode(ptr.Get(), actor, uniqueName);
 	NodeMap.Add(newChild->Id, newChild);
-	ActorIdToNodeId.Add(actor->GetActorGuid(), newChild->Id);
+	newChild->RegisteredActorGuid = actor->GetActorGuid();
+	ActorIdToNodeId.Add(newChild->RegisteredActorGuid, newChild->Id);
 	newChild->nosMetaData.Add(NosMetadataKeys::PinnedCategories, "Transform");
 	
 	if (actor->GetRootComponent())
@@ -191,7 +192,8 @@ TSharedPtr<ActorNode> NOSSceneTree::AddActor(TreeNode* parent, AActor* actor, FN
 
 	TSharedPtr<ActorNode> newChild = CreateActorNode(parent, actor, uniqueName);
 	NodeMap.Add(newChild->Id, newChild);
-	ActorIdToNodeId.Add(actor->GetActorGuid(), newChild->Id);
+	newChild->RegisteredActorGuid = actor->GetActorGuid();
+	ActorIdToNodeId.Add(newChild->RegisteredActorGuid, newChild->Id);
 	newChild->nosMetaData.Add(NosMetadataKeys::PinnedCategories, "Transform");
 	
 	if (actor->GetRootComponent())
@@ -227,6 +229,7 @@ TSharedPtr<SceneComponentNode> NOSSceneTree::AddSceneComponent(ActorNode* parent
 	newComponentNode->NeedsReload = true;
 	parent->Children.push_back(newComponentNode);
 	NodeMap.Add(newComponentNode->Id, newComponentNode);
+	newComponentNode->RegisteredComponentKey = sceneComponent;
 
 	TSharedPtr<SceneComponentNode> loadingChild(new SceneComponentNode);
 	loadingChild->Name = "Loading";
@@ -261,6 +264,7 @@ TSharedPtr<SceneComponentNode> NOSSceneTree::AddSceneComponent(TSharedPtr<SceneC
 	newComponentNode->NeedsReload = true;
 	parent->Children.push_back(newComponentNode);
 	NodeMap.Add(newComponentNode->Id, newComponentNode);
+	newComponentNode->RegisteredComponentKey = sceneComponent;
 
 	TSharedPtr<SceneComponentNode> loadingChild(new SceneComponentNode);
 	loadingChild->Name = "Loading";
@@ -312,6 +316,33 @@ TreeNode* NOSSceneTree::GetNode(FGuid NodeId)
 void NOSSceneTree::RemoveNode(FGuid NodeId)
 {
 	NodeMap.Remove(NodeId);
+}
+
+void NOSSceneTree::RemoveNodeAndDescendants(TreeNode* Node)
+{
+	if (!Node)
+		return;
+
+	// Descend through component nodes only. A deleted actor's child actors are re-parented onto a
+	// folder before we get here, so they are still live nodes and must keep their registrations.
+	for (auto& Child : Node->Children)
+	{
+		if (Child && Child->GetAsSceneComponentNode())
+			RemoveNodeAndDescendants(Child.Get());
+	}
+
+	if (auto* ComponentNode = Node->GetAsSceneComponentNode())
+	{
+		if (ComponentNode->RegisteredComponentKey)
+			SceneComponentToNodeMap.Remove(ComponentNode->RegisteredComponentKey);
+	}
+	else if (auto* AsActorNode = Node->GetAsActorNode())
+	{
+		if (AsActorNode->RegisteredActorGuid.IsValid())
+			ActorIdToNodeId.Remove(AsActorNode->RegisteredActorGuid);
+	}
+
+	NodeMap.Remove(Node->Id);
 }
 
 TreeNode* NOSSceneTree::GetFolderOrRoot(TreeNode* node)
