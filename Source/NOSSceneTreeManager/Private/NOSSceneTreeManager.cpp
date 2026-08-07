@@ -621,10 +621,33 @@ bool FilterNonSceneOutlinerActor(const AActor* Actor) {
 			(Actor->ActorHasTag(SequencerActorTag)));
 }
 
+// Only actors tagged ZDActor reach the tree.
+//
+// A studio level holds thousands of actors and a show drives a few dozen of
+// them. Every one that gets in costs memory in the tree, a populate to build
+// its properties and functions, and pin traffic to Nodos - for a light fixture
+// or a piece of set dressing nothing will ever address. Tagging is how the
+// project says which actors are meant to be driven.
+//
+// Off by default, because a project whose actors are not tagged would come up
+// with an empty tree and nothing would work. Turn it on once the content is
+// tagged, and watch the count this logs on load.
+static TAutoConsoleVariable<int32> CVarRequireZDActorTag(
+	TEXT("Nodos.RequireZDActorTag"),
+	0,
+	TEXT("Only expose actors tagged ZDActor to Nodos. Cuts the scene tree to what a show ")
+	TEXT("actually drives. 0 exposes every displayable actor, as stock."));
+
 bool IsActorDisplayable(const AActor* Actor, bool FilterNonSceneOutliner)
 {
 
 	if(Actor == nullptr)
+	{
+		return false;
+	}
+
+	static const FName ZDActorTag(TEXT("ZDActor"));
+	if (CVarRequireZDActorTag.GetValueOnGameThread() && !Actor->ActorHasTag(ZDActorTag))
 	{
 		return false;
 	}
@@ -2048,8 +2071,10 @@ void FNOSSceneTreeManager::RescanScene(bool reset)
 	flatbuffers::FlatBufferBuilder fbb;
 	std::vector<flatbuffers::Offset<nos::fb::Node>> actorNodes;
 	TArray<AActor*> ActorsInScene;
+	int32 ActorsSeen = 0;
 	for (TActorIterator< AActor > ActorItr(daWorld); ActorItr; ++ActorItr)
 	{
+		ActorsSeen++;
 		if (!IsActorDisplayable(*ActorItr, ShowHiddenActorsOnNodos))
 			continue;
 
@@ -2064,9 +2089,10 @@ void FNOSSceneTreeManager::RescanScene(bool reset)
 #ifdef VIEWPORT_TEXTURE
 	ConnectViewportTexture();
 #endif
-	// Kept at Display: it is once per level load, and it is the line that says
-	// how much of the scene Nodos can see.
-	UE_LOG(LogNOSSceneTreeManager, Display, TEXT("SceneTree is constructed."));
+	UE_LOG(LogNOSSceneTreeManager, Display,
+		TEXT("SceneTree is constructed: %d of %d actors exposed%s"),
+		ActorsInScene.Num(), ActorsSeen,
+		CVarRequireZDActorTag.GetValueOnGameThread() ? TEXT(" (ZDActor tag required)") : TEXT(""));
 	QueueBackgroundPopulate();
 }
 
