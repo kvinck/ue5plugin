@@ -378,8 +378,10 @@ void NOSTextureShareManager::ProcessCopies(nos::fb::ShowAs CopyShowAs)
 	GetActiveTextureCopiesWithShowAs(CopyShowAs, TextureProperties, CopiesFiltered);
 
 	//auto cmdData = GetNewCommandList();
+	// Moved, not copied: CopiesFiltered is a local that is dead after this enqueue, and copying it
+	// meant a map allocation plus a refcount bump per entry, twice every frame.
 	ENQUEUE_RENDER_COMMAND(FNOSClient_CopyOnTick)(
-		[this, CopyShowAs, CopiesFiltered, frameNumber = FrameCounter.load()](FRHICommandListImmediate& RHICmdList)
+		[this, CopyShowAs, CopiesFiltered = MoveTemp(CopiesFiltered), frameNumber = FrameCounter.load()](FRHICommandListImmediate& RHICmdList)
 		{
 #ifdef DEBUG_NODOS_TEXTURE_COPIES
 			SCOPED_CONDITIONAL_DRAW_EVENTF(RHICmdList, NodosCopies_Output, CopyShowAs == nos::fb::ShowAs::OUTPUT_PIN, TEXT("Nodos Copies(Output)"));
