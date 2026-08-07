@@ -321,6 +321,10 @@ public:
 	
 	UENodeStatusHandler UENodeStatusHandler;
 
+	// Compiling managers we currently have a status posted for, so Tick can skip the ones with
+	// nothing to say without building their name to find out.
+	TSet<struct IAssetCompilingManager*> CompilingManagersWithWarning;
+
 	int ReloadingLevel = 0;
 
 	bool bIsInitialized = false;

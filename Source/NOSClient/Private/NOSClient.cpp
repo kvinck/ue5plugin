@@ -818,7 +818,17 @@ bool FNOSClient::Tick(float dt)
 
 	for (IAssetCompilingManager* CompilingManager : FAssetCompilingManager::Get().GetRegisteredManagers())
 	{
-		int32 RemainingCount = CompilingManager->GetNumRemainingAssets();
+		const int32 RemainingCount = CompilingManager->GetNumRemainingAssets();
+		const bool bHasWarning = CompilingManagersWithWarning.Contains(CompilingManager);
+
+		// Nothing compiling and nothing posted for this manager, which is the case on almost every
+		// frame of almost every session. Bail before building the name - it costs an FName to
+		// FString to UTF-8 conversion and two std::string allocations, per manager, per tick.
+		if (!RemainingCount && !bHasWarning)
+		{
+			continue;
+		}
+
 		auto AssetTypeName = std::string(TCHAR_TO_UTF8(*CompilingManager->GetAssetTypeName().ToString())) + std::string("_compilation_warning");
 
 		if (RemainingCount)
@@ -829,10 +839,12 @@ bool FNOSClient::Tick(float dt)
 			CompilationStatus.text = TCHAR_TO_UTF8(*CompilationWarning);
 			CompilationStatus.type = nos::fb::NodeStatusMessageType::WARNING;
 			UENodeStatusHandler.Add(AssetTypeName, CompilationStatus);
+			CompilingManagersWithWarning.Add(CompilingManager);
 		}
 		else
 		{
 			UENodeStatusHandler.Remove(AssetTypeName);
+			CompilingManagersWithWarning.Remove(CompilingManager);
 		}
 	}
 
@@ -969,6 +981,14 @@ void UENodeStatusHandler::SetClient(FNOSClient* _PluginClient)
 
 void UENodeStatusHandler::Add(std::string const& Id, nos::fb::TNodeStatusMessage const& Status)
 {
+	// Re-posting an identical status is not a change. Without this, a caller that reasserts the
+	// same message every tick marks the handler dirty every tick and Update() sends the whole
+	// status list over gRPC every frame.
+	auto it = StatusMessages.find(Id);
+	if (it != StatusMessages.end() && it->second.text == Status.text && it->second.type == Status.type)
+	{
+		return;
+	}
 	StatusMessages[Id] = Status;
 	Dirty = true;
 }
