@@ -3166,7 +3166,7 @@ void FNOSSceneTreeManager::HandleWorldChange()
 	std::vector<nos::fb::UUID> graphPins;// = { *(nos::fb::UUID*)&node->Id };
 	std::vector<flatbuffers::Offset<nos::PartialPinUpdate>> PinUpdates;
 
-	for (auto [id, portal] : NOSPropertyManager.PortalPinsById)
+	for (auto& [id, portal] : NOSPropertyManager.PortalPinsById)
 	{
 		if (!NOSPropertyManager.PropertiesById.Contains(portal.SourceId))
 		{
@@ -3876,7 +3876,7 @@ void FNOSPropertyManager::ActorDeleted(FGuid DeletedActorId)
 {
 }
 
-flatbuffers::Offset<nos::fb::Pin> FNOSPropertyManager::SerializePortal(flatbuffers::FlatBufferBuilder& fbb, NOSPortal Portal, NOSProperty* SourceProperty)
+flatbuffers::Offset<nos::fb::Pin> FNOSPropertyManager::SerializePortal(flatbuffers::FlatBufferBuilder& fbb, NOSPortal const& Portal, NOSProperty* SourceProperty)
 {
 	auto SerializedMetadata = SourceProperty->SerializeMetaData(fbb);
 	return nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)&Portal.Id, TCHAR_TO_UTF8(*Portal.UniqueName), TCHAR_TO_UTF8(*Portal.TypeName), Portal.ShowAs, SourceProperty->PinCanShowAs, TCHAR_TO_UTF8(*Portal.CategoryName), SourceProperty->SerializeVisualizer(fbb), &SourceProperty->data, 0, 0, 0, 0, 0, SourceProperty->ReadOnly, 0, false, &SerializedMetadata, 0, nos::fb::PinContents::PortalPin, nos::fb::CreatePortalPin(fbb, (nos::fb::UUID*)&Portal.SourceId).Union(), 0, nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE, TCHAR_TO_UTF8(*SourceProperty->ToolTipText), TCHAR_TO_UTF8(*Portal.DisplayName));
@@ -3913,9 +3913,10 @@ void FNOSPropertyManager::OnBeginFrame()
 			NOSClient->OnNOSPinValueChanged.Broadcast(*(nos::fb::UUID*)&id, val.As<u8>(), val.Size(), false);
 		}
 	}
-	for (auto [id, portal] : PortalPinsById)
+	// By reference: NOSPortal carries four FStrings, and this runs every frame for every portal.
+	for (auto& [id, portal] : PortalPinsById)
 	{
-		if (portal.ShowAs == nos::fb::ShowAs::OUTPUT_PIN || 
+		if (portal.ShowAs == nos::fb::ShowAs::OUTPUT_PIN ||
 		    !PropertiesById.Contains(portal.SourceId))
 		{
 			continue;
