@@ -128,10 +128,13 @@ void FNOSSceneTreeManager::OnBeginFrame()
 {
 	if(ToggleExecutionStateToSynced)
 	{
-		ToggleExecutionStateToSynced = false;
-		ExecutionState = nos::app::ExecutionState::SYNCED;
+		// Only take the transition once the texture share manager actually made it. It declines
+		// while an idle switch is still in flight; leaving the flag set retries next frame, which
+		// beats blocking here and beats recording a synced state that never happened.
 		if (NOSTextureShareManager::GetInstance()->SwitchStateToSynced())
 		{
+			ToggleExecutionStateToSynced = false;
+			ExecutionState = nos::app::ExecutionState::SYNCED;
 			SendSyncSemaphores(false);
 		}
 	}

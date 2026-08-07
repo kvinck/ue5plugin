@@ -3,6 +3,7 @@
 #include "NOSTextureShareManager.h"
 
 #include "HardwareInfo.h"
+#include "Misc/ScopeExit.h"
 
 #pragma warning (disable : 4800)
 #pragma warning (disable : 4668)
@@ -457,7 +458,14 @@ void NOSTextureShareManager::OnEndFrame()
 
 bool NOSTextureShareManager::SwitchStateToSynced()
 {
-	FScopeLock Lock(&CriticalSectionState);
+	// This runs on the game thread. SwitchStateToIdle_GRPCThread holds this lock across two
+	// rounds of fence signalling and a fifth of a second of sleep each - the lock has to span
+	// that, because RenewSemaphores below would otherwise destroy the fences out from under it.
+	// So rather than block a rendering game thread for up to four hundred milliseconds, decline
+	// and let the caller come back next frame.
+	if (!CriticalSectionState.TryLock())
+		return false;
+	ON_SCOPE_EXIT{ CriticalSectionState.Unlock(); };
 	RenewSemaphores();
 	ENQUEUE_RENDER_COMMAND(FNOSClient_CopyOnTick)(
 		[this](FRHICommandListImmediate& RHICmdList)
