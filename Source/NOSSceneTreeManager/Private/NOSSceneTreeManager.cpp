@@ -584,13 +584,22 @@ bool FNOSSceneTreeManager::CheckNewLevels(float dt)
 
 	bool backupAlwaysUpdateOnActorSpawns = AlwaysUpdateOnActorSpawns;
 	AlwaysUpdateOnActorSpawns = true;
+
+	// Forget levels that have been collected. OnLevelRemovedFromWorld drops them by identity when
+	// it fires; this catches the ones it did not, so the set does not grow for the life of the
+	// session on a show that streams levels continuously.
+	for (auto It = AlreadyLoadedStreamingLevels.CreateIterator(); It; ++It)
+	{
+		if (!It->IsValid())
+			It.RemoveCurrent();
+	}
+
 	auto& streamingLevels = daWorld->GetStreamingLevels();
 	for (auto* level : streamingLevels)
 	{
 		auto loadedLevel = level->GetLoadedLevel();
 		if (!loadedLevel)
 		{
-			AlreadyLoadedStreamingLevels.Remove(loadedLevel);
 			continue;
 		}
 		if (!AlreadyLoadedStreamingLevels.Contains(loadedLevel))
