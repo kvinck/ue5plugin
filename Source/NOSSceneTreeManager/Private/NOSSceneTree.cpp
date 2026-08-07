@@ -44,25 +44,13 @@ TSharedPtr<FolderNode> NOSSceneTree::FindOrAddChildFolder(TSharedPtr<TreeNode> n
 
 void NOSSceneTree::Clear()
 {
-	ClearRecursive(Root);
+	// Dropping the root's children releases the shared pointers holding the rest of the tree.
+	Root->Children.clear();
 	NodeMap.Empty();
 	ActorIdToNodeId.Empty();
 	NodeMap.Add(Root->Id, Root);
 	SceneComponentToNodeMap.Empty();
 	LastNodosSpawnedActorIndex = 0;
-}
-
-void NOSSceneTree::ClearRecursive(TSharedPtr<TreeNode> node)
-{
-	for (auto child : node->Children)
-	{
-		ClearRecursive(child);
-	}
-	if (node == Root)
-	{
-		Root->Children.clear();
-		return;
-	}
 }
 
 FString NOSSceneTree::GetGeneratedNodeNameForActor(FString Name)

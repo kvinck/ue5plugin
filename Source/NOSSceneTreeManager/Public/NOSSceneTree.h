@@ -111,7 +111,6 @@ private:
 	TMap<FGuid, TSharedPtr<TreeNode>> NodeMap;
 	TMap<FGuid, FGuid> ActorIdToNodeId;
 	TMap<USceneComponent*, TSharedPtr<SceneComponentNode>> SceneComponentToNodeMap;
-	void ClearRecursive(TSharedPtr<TreeNode> node);
 
 	uint64_t LastNodosSpawnedActorIndex = 0;
 	static std::optional<uint64_t> GetActorIndexFromName(FString Name);
