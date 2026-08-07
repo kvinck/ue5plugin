@@ -318,30 +318,6 @@ void NOSTextureShareManager::TextureDestroyed(NOSProperty* textureProp)
 	TextureProperties.Remove(textureProp);
 }
 
-static HANDLE DupeHandle(uint64_t pid, HANDLE handle)
-{
-    HANDLE re = 0;
-    HANDLE src = OpenProcess(GENERIC_ALL, false, pid);
-    HANDLE cur = GetCurrentProcess();
-    if (!DuplicateHandle(src, handle, cur, &re, GENERIC_ALL, 0, DUPLICATE_SAME_ACCESS))
-    {
-        return 0;
-    }
-    CloseHandle(src);
-    return re;
-}
-
-static bool ImportSharedFence(uint64_t pid, HANDLE handle, ID3D12Device* pDevice, ID3D12Fence** pFence)
-{
-       HANDLE xmemory = DupeHandle(pid, handle);
-       if (FAILED(pDevice->OpenSharedHandle(xmemory, IID_PPV_ARGS(pFence))))
-       {
-               return false;
-       }
-       CloseHandle(xmemory);
-       return true;
-}
-
 /// Returns only the active copies that match the given ShowAs
 void GetActiveTextureCopiesWithShowAs(nos::fb::ShowAs FilterShowAs, TMap<NOSProperty*, TSharedPtr<TexturePropertyInfo>>& textureProperties, TMap<UTextureRenderTarget2D*, TSharedPtr<SharedResourceInfo>>& FilteredCopies)
 {
