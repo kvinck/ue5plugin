@@ -451,12 +451,21 @@ void NOSTextureShareManager::OnEndFrame()
 {
 	ProcessCopies(nos::fb::ShowAs::OUTPUT_PIN);
 	FrameCounter++;
+	// Retire what has aged out. FlushRenderingCommands blocks the game thread until the render
+	// thread drains, so it is paid once for the whole batch rather than once per resource - a
+	// resolution change across a set of pins used to queue one full stall per pin, all in this
+	// one frame.
+	bool bFlushed = false;
 	while(!ResourcesToDelete.IsEmpty())
 	{
 		auto* resource = ResourcesToDelete.Peek();
 		if(resource->Value + 5 <= GFrameCounter) // resources are deleted after 5 frames, because we need to make sure that they are no longer in use
 		{
-			FlushRenderingCommands();
+			if (!bFlushed)
+			{
+				FlushRenderingCommands();
+				bFlushed = true;
+			}
 			ResourcesToDelete.Pop();
 		}
 		else
