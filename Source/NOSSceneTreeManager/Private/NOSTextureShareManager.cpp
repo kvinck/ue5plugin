@@ -307,7 +307,12 @@ void NOSTextureShareManager::UpdatePinShowAs(NOSProperty* NosProperty, nos::fb::
 
 void NOSTextureShareManager::TextureDestroyed(NOSProperty* textureProp)
 {
+	// Not every texture property is registered here. Reset() empties the map, so an actor deleted
+	// after a node import - or after a world change - reaches this with a property we no longer
+	// know about. Find returns null then, and dereferencing it takes the editor down.
 	auto texPropInfo = TextureProperties.Find(textureProp);
+	if (!texPropInfo)
+		return;
 	if ((*texPropInfo)->ActiveDestinationSharedResource)
 		ResourcesToDelete.Enqueue({ std::move((*texPropInfo)->ActiveDestinationSharedResource), GFrameCounter });
 	TextureProperties.Remove(textureProp);
