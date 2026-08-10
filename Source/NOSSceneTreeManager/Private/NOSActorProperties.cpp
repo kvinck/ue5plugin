@@ -215,7 +215,10 @@ void NOSProperty::MarkState()
 void NOSProperty::SetPropValue(void* val, size_t size, uint8* customContainer)
 {
 	SetPropValue_Internal(val, size, customContainer);
-	CallOnChangedFunction();
+	if (ShouldCallOnChangedFunction())
+	{
+		CallOnChangedFunction();
+	}
 }
 
 void NOSProperty::SetPropValue_Internal(void* val, size_t size, uint8* customContainer)
@@ -1332,7 +1335,7 @@ flatbuffers::Offset<nos::fb::Pin> NOSEnumProperty::Serialize(flatbuffers::FlatBu
 
 void NOSEnumProperty::SetPropValue_Internal(void* val, size_t size, uint8* customContainer)
 {
-	IsChanged = true;
+	bValueChanged = false;
 	if (!val || size == 0 || size > MAX_int32)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("Invalid value buffer for enum property %s."), *DisplayName);
@@ -1385,11 +1388,21 @@ void NOSEnumProperty::SetPropValue_Internal(void* val, size_t size, uint8* custo
 			}
 
 			uint8* PropData = Property->ContainerPtrToValuePtr<uint8>(container);
+			if (NumericProperty->GetSignedIntPropertyValue(PropData) == Value)
+			{
+				return;
+			}
+
 			NumericProperty->SetIntPropertyValue(PropData, Value);
+			bValueChanged = true;
+			IsChanged = true;
 		}
 	}
 
-	MarkState();
+	if (bValueChanged)
+	{
+		MarkState();
+	}
 
 	return;
 }

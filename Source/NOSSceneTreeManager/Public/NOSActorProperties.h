@@ -211,6 +211,7 @@ public:
 protected:
 	virtual void SetPropValue_Internal(void* val, size_t size, uint8* customContainer = nullptr);
 	virtual void SetProperty_InCont(void* container, void* val);
+	virtual bool ShouldCallOnChangedFunction() const { return true; }
 
 private:
 	void CallOnChangedFunction();
@@ -372,6 +373,12 @@ public:
 	virtual flatbuffers::Offset<nos::fb::Visualizer> SerializeVisualizer(flatbuffers::FlatBufferBuilder& fbb) override;
 	virtual void SetPropValue_Internal(void* val, size_t size, uint8* customContainer = nullptr) override;
 	virtual std::vector<uint8> UpdatePinValue(uint8* customContainer = nullptr) override; 
+
+protected:
+	virtual bool ShouldCallOnChangedFunction() const override { return bValueChanged; }
+
+private:
+	bool bValueChanged = false;
 
 };
 
