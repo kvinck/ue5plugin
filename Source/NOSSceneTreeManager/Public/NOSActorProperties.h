@@ -337,19 +337,19 @@ public:
 		data = std::vector<uint8_t>(1, 0); 
 		TypeName = "string";
 
-		int EnumSize = Enum->NumEnums();
-		for(int i = 0; i < EnumSize; i++)
+		const int32 EnumSize = Enum->NumEnums() - (Enum->ContainsExistingMax() ? 1 : 0);
+		std::vector<std::string> NameList;
+		NameList.reserve(EnumSize);
+		for (int32 i = 0; i < EnumSize; ++i)
 		{
-			NameMap.Add(Enum->GetDisplayNameTextByIndex(i).ToString(), Enum->GetValueByIndex(i));
+			const FString EnumDisplayName = Enum->GetDisplayNameTextByIndex(i).ToString();
+			const int64 Value = Enum->GetValueByIndex(i);
+			NameMap.Add(EnumDisplayName, Value);
+			ValidValues.Add(Value);
+			NameList.emplace_back(TCHAR_TO_UTF8(*EnumDisplayName));
 		}
 	
 		flatbuffers::FlatBufferBuilder mb;
-
-		std::vector<std::string> NameList;
-		for (const auto& [name, _] : NameMap)
-		{
-			NameList.push_back(TCHAR_TO_UTF8(*name));
-		}
 
 		auto offset = nos::app::CreateUpdateStringList(mb, nos::fb::CreateStringList(mb, mb.CreateString(TCHAR_TO_UTF8(*PrefixStringList(Enum->GetFName().ToString()))), mb.CreateVectorOfStrings(NameList)));
 		mb.Finish(offset);
@@ -362,6 +362,7 @@ public:
 
 	FString NodosListName;
 	TMap<FString, int64> NameMap;
+	TSet<int64> ValidValues;
 	FString CurrentName;
 	int64 CurrentValue;
 	UEnum* Enum;

@@ -1332,9 +1332,12 @@ flatbuffers::Offset<nos::fb::Pin> NOSEnumProperty::Serialize(flatbuffers::FlatBu
 
 void NOSEnumProperty::SetPropValue_Internal(void* val, size_t size, uint8* customContainer)
 {
-	//TODO
-
 	IsChanged = true;
+	if (!val || size == 0 || size > MAX_int32)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Invalid value buffer for enum property %s."), *DisplayName);
+		return;
+	}
 
 	void* container = nullptr;
 	if (customContainer) container = customContainer;
@@ -1360,15 +1363,29 @@ void NOSEnumProperty::SetPropValue_Internal(void* val, size_t size, uint8* custo
 
 		if (EnumPtr && NumericProperty)
 		{
-			FString ValueString((char*)val);
-
-			auto result = NameMap.Find(ValueString);
-			if (result != nullptr)
+			const uint8* Bytes = static_cast<const uint8*>(val);
+			int32 InputLength = 0;
+			while (InputLength < static_cast<int32>(size) && Bytes[InputLength] != 0)
 			{
-				int64 Value = EnumPtr->GetValueByIndex(*result);
-				uint8* PropData = Property->ContainerPtrToValuePtr<uint8>(container);
-				NumericProperty->SetIntPropertyValue(PropData, Value);
+				++InputLength;
 			}
+			const auto Converted = StringCast<TCHAR>(reinterpret_cast<const UTF8CHAR*>(Bytes), InputLength);
+			const FString ValueString(Converted.Length(), Converted.Get());
+
+			int64 Value = EnumPtr->GetValueByNameString(ValueString);
+			if (const int64* DisplayValue = NameMap.Find(ValueString))
+			{
+				Value = *DisplayValue;
+			}
+
+			if (!ValidValues.Contains(Value))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("Unknown value '%s' for enum property %s."), *ValueString, *DisplayName);
+				return;
+			}
+
+			uint8* PropData = Property->ContainerPtrToValuePtr<uint8>(container);
+			NumericProperty->SetIntPropertyValue(PropData, Value);
 		}
 	}
 
@@ -1386,7 +1403,7 @@ std::vector<uint8> NOSEnumProperty::UpdatePinValue(uint8* customContainer)
 	else if (ObjectPtr && IsValid(ObjectPtr)) container = ObjectPtr;
 	else if (StructPtr) container = StructPtr;
 
-	FString val(" ");
+	FString val;
 
 	if (container)
 	{
@@ -1406,12 +1423,13 @@ std::vector<uint8> NOSEnumProperty::UpdatePinValue(uint8* customContainer)
 		if (EnumPtr && NumericProperty)
 		{
 			uint8* PropData = Property->ContainerPtrToValuePtr<uint8>(container);
-			CurrentName = Enum->GetNameByValue(*PropData).ToString();
+			const int64 Value = NumericProperty->GetSignedIntPropertyValue(PropData);
+			CurrentName = EnumPtr->GetDisplayNameTextByValue(Value).ToString();
 			val = CurrentName;
 		}
 	}
 
-	auto s = StringCast<ANSICHAR>(*val);
+	auto s = StringCast<UTF8CHAR>(*val);
 	data = std::vector<uint8_t>(s.Length() + 1, 0);
 	memcpy(data.data(), s.Get(), s.Length());
 
