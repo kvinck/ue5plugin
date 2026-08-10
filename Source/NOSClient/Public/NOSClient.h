@@ -33,7 +33,7 @@ struct ExecuteFrameNumberQueue : public TQueue<ExecuteInfo>
 	ExecuteInfo PopFrameNumber(uint64_t frameNumber, float maxWaitTime)
 	{
 		ExecuteInfo executeInfo{};
-		DiscardExcessThenDequeue(executeInfo, frameNumber, true, maxWaitTime);
+		DequeueThroughFrame(executeInfo, frameNumber, maxWaitTime);
 		return executeInfo;
 	}
 	void EnqueueExecuteStart(nos::app::AppExecuteStart const* appExecuteStart)
@@ -56,39 +56,45 @@ struct ExecuteFrameNumberQueue : public TQueue<ExecuteInfo>
 			Enqueue(std::move(start));
 	}
 private:
-	void DiscardExcessThenDequeue(ExecuteInfo& result, uint64_t requestedFrameNumber, bool wait, float maxWaitTime)
+	void DequeueThroughFrame(ExecuteInfo& result, uint64_t requestedFrameNumber, float maxWaitTime)
 	{
 		std::scoped_lock lock(Guard);
 		uint32_t tryCount = 0;
 		bool dequeued = false;
-		bool oldLiveNow = LiveNow;
+		bool sawFutureFrame = false;
+		const bool oldLiveNow = LiveNow;
 		constexpr int retryCount = 20;
 		FPlatformProcess::ConditionalSleep([&]()
 			{
-				while (Peek(result))
+				while (const ExecuteInfo* next = Peek())
 				{
-					LiveNow = true;
-					dequeued = true;
-					if (result.FrameNumber <= requestedFrameNumber)
+					if (next->FrameNumber > requestedFrameNumber)
 					{
-						ExecuteInfo pop;
-						Pop();
+						sawFutureFrame = true;
+						return true;
 					}
-					if (result.FrameNumber >= requestedFrameNumber)
+
+					ExecuteInfo current;
+					Dequeue(current);
+					dequeued = true;
+					result.FrameNumber = current.FrameNumber;
+					result.PinValueUpdates.Append(MoveTemp(current.PinValueUpdates));
+
+					if (result.FrameNumber == requestedFrameNumber)
 					{
 						return true;
 					}
 				}
 
-				return !LiveNow || !wait || tryCount++ > retryCount;
+				return (!oldLiveNow && !dequeued) || tryCount++ >= retryCount;
 			}, maxWaitTime / retryCount);
 
-		LiveNow = dequeued;
+		LiveNow = dequeued || sawFutureFrame;
 		if (oldLiveNow != LiveNow)
 			UE_LOG(LogCore, Warning, TEXT("LiveNow Changed"));
 
-		if (LiveNow && result.FrameNumber != requestedFrameNumber)
-			UE_LOG(LogCore, Warning, TEXT("Mismatch between popped frame number and requested frame number: %i, %i"), result.FrameNumber, requestedFrameNumber);
+		if (dequeued && result.FrameNumber != requestedFrameNumber)
+			UE_LOG(LogCore, Warning, TEXT("Delivered late execute updates through frame %llu while Unreal requested frame %llu"), result.FrameNumber, requestedFrameNumber);
 	}
 	
 	bool LiveNow = true;
