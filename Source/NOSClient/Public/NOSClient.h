@@ -50,6 +50,7 @@ struct ExecuteFrameNumberQueue : public TQueue<ExecuteInfo>
 		{
 			std::scoped_lock lock(Guard);
 			Empty();
+			Enqueue(std::move(start));
 		}
 		else
 			Enqueue(std::move(start));
