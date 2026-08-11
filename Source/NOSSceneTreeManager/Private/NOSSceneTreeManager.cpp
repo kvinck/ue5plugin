@@ -764,14 +764,17 @@ bool FilterNonSceneOutlinerActor(const AActor* Actor) {
 // or a piece of set dressing nothing will ever address. Tagging is how the
 // project says which actors are meant to be driven.
 //
-// Off by default, because a project whose actors are not tagged would come up
-// with an empty tree and nothing would work. Turn it on once the content is
-// tagged, and watch the count this logs on load.
+// On by default. Note what that means for a project whose actors are not
+// tagged: it comes up with an empty tree and nothing works. That is loud rather
+// than subtle, and the count logged on load says so directly - "0 of 265 actors
+// exposed (ZDActor tag required)" - but if a show ever comes up empty, this is
+// the first thing to check. Set it to 0 to get every displayable actor back.
 static TAutoConsoleVariable<int32> CVarRequireZDActorTag(
 	TEXT("Nodos.RequireZDActorTag"),
-	0,
+	1,
 	TEXT("Only expose actors tagged ZDActor to Nodos. Cuts the scene tree to what a show ")
-	TEXT("actually drives. 0 exposes every displayable actor, as stock."));
+	TEXT("actually drives. 0 exposes every displayable actor, as stock. If the tree comes ")
+	TEXT("up empty, the content is not tagged - set this to 0."));
 
 bool IsActorDisplayable(const AActor* Actor, bool FilterNonSceneOutliner)
 {
@@ -2231,6 +2234,46 @@ void FNOSSceneTreeManager::RescanScene(bool reset)
 	QueueBackgroundPopulate();
 }
 
+// A static mesh component is 181 pins, and 176 of them are things like
+// bReverseCulling and bCastDistanceFieldIndirectShadow that no show will ever
+// drive. They are not a rounding error: on this project 167 mesh components
+// carry 84% of every pin in the scene, and four actors account for 60% of it -
+// all of them props inside blueprints the show does drive, so no actor-level
+// filter reaches them. Building all of it is most of the load's pin traffic and
+// most of the half-second each actor costs to build.
+//
+// So a mesh gets the five pins anyone actually reaches for and nothing else.
+// It stays in the tree, stays addressable, and stays movable.
+static TAutoConsoleVariable<int32> CVarStaticMeshTransformPinsOnly(
+	TEXT("Nodos.StaticMeshTransformPinsOnly"),
+	1,
+	TEXT("Expose only transform, visibility and hidden-in-game on static mesh components, ")
+	TEXT("instead of every editable property. 0 exposes all of them, as stock."));
+
+// Deliberately static mesh components only, not every primitive. The other
+// component types are 2,711 pins between them - not worth the loss of control,
+// and a mesh prop is the one thing a scene has hundreds of.
+static bool ShouldExposeTransformOnly(const UActorComponent* Component)
+{
+	return Component
+		&& CVarStaticMeshTransformPinsOnly.GetValueOnGameThread()
+		&& Component->IsA(UStaticMeshComponent::StaticClass());
+}
+
+static bool IsTransformProperty(const FProperty* Property)
+{
+	// The two visibility flags are private bitfields, so no GET_MEMBER_NAME_CHECKED
+	// to lean on - these are the names as they appear on the pins today.
+	static const TSet<FName> TransformPropertyNames = {
+		USceneComponent::GetRelativeLocationPropertyName(),
+		USceneComponent::GetRelativeRotationPropertyName(),
+		USceneComponent::GetRelativeScale3DPropertyName(),
+		FName(TEXT("bVisible")),
+		FName(TEXT("bHiddenInGame")),
+	};
+	return Property && TransformPropertyNames.Contains(Property->GetFName());
+}
+
 bool PropertyVisible(FProperty* ueproperty)
 {
 	return !ueproperty->HasAllPropertyFlags(CPF_DisableEditOnInstance) &&
@@ -2624,6 +2667,8 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 		auto ComponentNode = treeNode->GetAsSceneComponentNode();
 		auto ComponentClass = Component->GetClass();
 
+		const bool bTransformOnly = ShouldExposeTransformOnly(Component.Get());
+
 		for (FProperty* Property = ComponentClass->PropertyLink; Property; Property = Property->PropertyLinkNext)
 		{
 
@@ -2631,6 +2676,11 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 			UClass* Class = Component->GetClass();
 
 			if (!PropertyVisible(Property) || FEditorCategoryUtils::IsCategoryHiddenFromClass(Class, CategoryName.ToString()))
+			{
+				continue;
+			}
+
+			if (bTransformOnly && !IsTransformProperty(Property))
 			{
 				continue;
 			}
