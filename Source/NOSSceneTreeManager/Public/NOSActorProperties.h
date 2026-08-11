@@ -162,7 +162,13 @@ public:
 	
 	virtual bool CreateFbArray(flatbuffers::FlatBufferBuilder& fb, FScriptArrayHelper_InContainer& ArrayHelper) {return false;}
 	virtual void SetArrayPropValues(void* val, size_t size, FScriptArrayHelper_InContainer& ArrayHelper) {}
-	
+
+	// Applies bHidden / bVisible / bHiddenInGame through the engine setter rather
+	// than writing the bit, which is the only way the change reaches the renderer.
+	// Returns true if it handled the write, in which case the caller must not also
+	// write the property. See the comment on the definition.
+	bool TrySetVisibilityThroughSetter(void* val);
+
 	FProperty* Property = nullptr;
 
 	NOSActorReference ActorContainer;

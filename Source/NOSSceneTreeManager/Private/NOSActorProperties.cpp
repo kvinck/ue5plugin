@@ -202,6 +202,80 @@ std::vector<uint8> NOSProperty::UpdatePinValue(uint8* customContainer)
 	return data;
 }
 
+// Visibility is not a flag you can just write.
+//
+// bHidden, bVisible and bHiddenInGame are private bitfields, and everything
+// that makes a change visible lives in the setter beside them, not in the flag:
+// SetActorHiddenInGame calls UpdateComponentVisibility, and SetVisibility and
+// SetHiddenInGame call OnVisibilityChanged and OnHiddenInGameChanged, which are
+// what mark the render state dirty. The editor gets this for free - ticking the
+// checkbox in the details panel goes through PostEditChangeProperty, which
+// calls those same handlers.
+//
+// A pin write does not. FProperty::SetPropertyValue_InContainer sets the bit
+// and stops, so the value reads back correctly everywhere - the graph, the
+// details panel, the next UpdatePinValue - while the object carries on
+// rendering exactly as it was. That is the whole of why toggling visibility
+// from Reality Hub does nothing.
+//
+// So route these three to their setters. The ordering matters: this has to run
+// instead of the raw write, not after it, because every one of them early-outs
+// when the flag already holds the value being set - write first and the setter
+// becomes a no-op.
+//
+// Child propagation is left off, matching what the details panel does. The
+// engine still walks the children to dirty their render state; it just does not
+// rewrite their flags. To hide an actor and everything under it, the actor's
+// own "Actor Hidden In Game" is the pin for that.
+bool NOSProperty::TrySetVisibilityThroughSetter(void* val)
+{
+	if (!val || !Property || !Property->IsA<FBoolProperty>())
+	{
+		return false;
+	}
+
+	static const FName NAME_bHidden(TEXT("bHidden"));
+	static const FName NAME_bVisible(TEXT("bVisible"));
+	static const FName NAME_bHiddenInGame(TEXT("bHiddenInGame"));
+
+	const FName PropName = Property->GetFName();
+	if (PropName != NAME_bHidden && PropName != NAME_bVisible && PropName != NAME_bHiddenInGame)
+	{
+		return false;
+	}
+
+	const bool bNewValue = *static_cast<bool*>(val);
+	auto* SceneComponent = Cast<USceneComponent>(ComponentContainer.Get());
+
+	if (PropName == NAME_bHidden)
+	{
+		// Only ever an actor's; a component has no bHidden.
+		if (AActor* Actor = ActorContainer.Get())
+		{
+			Actor->SetActorHiddenInGame(bNewValue);
+			return true;
+		}
+		return false;
+	}
+
+	if (PropName == NAME_bVisible)
+	{
+		if (SceneComponent)
+		{
+			SceneComponent->SetVisibility(bNewValue, false);
+			return true;
+		}
+		return false;
+	}
+
+	if (SceneComponent)
+	{
+		SceneComponent->SetHiddenInGame(bNewValue, false);
+		return true;
+	}
+	return false;
+}
+
 void NOSProperty::MarkState()
 {
 	if (BoundComponent)
@@ -237,6 +311,13 @@ void NOSProperty::SetPropValue_Internal(void* val, size_t size, uint8* customCon
 	{
 		UE_LOG(LogTemp, Warning, TEXT("The property %s has null container!"), *(DisplayName));
 		return; //TODO investigate why container is null
+	}
+
+	// Not for a customContainer: that is a function's parameter block, where the
+	// bool is an argument being marshalled, not a live object's visibility.
+	if (!customContainer && TrySetVisibilityThroughSetter(val))
+	{
+		return;
 	}
 
 	SetProperty_InCont(container, val);
