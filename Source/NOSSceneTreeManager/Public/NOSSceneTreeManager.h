@@ -80,7 +80,8 @@ struct SavedActorData
 class NOSSCENETREEMANAGER_API FNOSActorManager
 {
 public:
-	FNOSActorManager(NOSSceneTree& SceneTree) : SceneTree(SceneTree)
+	FNOSActorManager(NOSSceneTree& SceneTree, TFunction<void(ActorNode*)> InOnActorAddedToSceneTree)
+		: SceneTree(SceneTree), OnActorAddedToSceneTree(MoveTemp(InOnActorAddedToSceneTree))
 	{
 		NOSAssetManager = &FModuleManager::LoadModuleChecked<FNOSAssetManager>("NOSAssetManager");
 		NOSClient = &FModuleManager::LoadModuleChecked<FNOSClient>("NOSClient");
@@ -106,6 +107,7 @@ public:
 	NOSSceneTree& SceneTree;
 	class FNOSAssetManager* NOSAssetManager;
 	class FNOSClient* NOSClient;
+	TFunction<void(ActorNode*)> OnActorAddedToSceneTree;
 	
 	TSet<FGuid> ActorIds;
 	TArray< TPair<NOSActorReference, SavedActorData> > Actors;
@@ -144,6 +146,9 @@ public:
 	// Queues every actor the last rescan found, to be populated over the coming
 	// frames rather than when something first asks for one.
 	void QueueBackgroundPopulate();
+	// Adds an actor that appeared after the scan - spawned, attached or streamed
+	// in - to the same queue.
+	void QueueActorForBackgroundPopulate(ActorNode* Node);
 	// Populates as many queued actors as fit in this frame's budget.
 	void TickBackgroundPopulate();
 	// Gathers the actors beneath a folder the scan produced.
@@ -379,8 +384,15 @@ public:
 	// queued and being reached, and an id that no longer resolves is simply
 	// skipped.
 	TArray<FGuid> ActorsToBePopulated;
+	// Membership index for the queue above. Actors are queued from the scan and
+	// from every path that can add one afterwards, so duplicates are common and a
+	// linear check would be quadratic over a scene's worth of them.
+	TSet<FGuid> QueuedForPopulate;
 	int32 BackgroundPopulateQueued = 0;
 	double BackgroundPopulateStartedAt = 0.0;
+	// Set once, at the first transition to synced. Nothing is populated before it:
+	// building during startup delays the very handshake that sets it.
+	bool bHasGoneLive = false;
 
 	static TSet<FGuid> PropertiesNeeded;
 

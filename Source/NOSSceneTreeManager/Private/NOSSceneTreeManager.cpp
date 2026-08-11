@@ -135,6 +135,10 @@ void FNOSSceneTreeManager::OnBeginFrame()
 		{
 			ToggleExecutionStateToSynced = false;
 			ExecutionState = nos::app::ExecutionState::SYNCED;
+			// Startup is over and background population can begin. A latch, not a
+			// mirror of the state: an idle switch later in the show does not put us
+			// back into startup.
+			bHasGoneLive = true;
 			SendSyncSemaphores(false);
 		}
 	}
@@ -228,7 +232,10 @@ void FNOSSceneTreeManager::StartupModule()
 
 	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateRaw(this, &FNOSSceneTreeManager::Tick));
 	FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateRaw(this, &FNOSSceneTreeManager::CheckNewLevels), .5f);
-	NOSActorManager = new FNOSActorManager(SceneTree);
+	NOSActorManager = new FNOSActorManager(SceneTree, [this](ActorNode* Node)
+	{
+		QueueActorForBackgroundPopulate(Node);
+	});
 	//Bind to Nodos events
 	NOSClient->OnNOSNodeSelected.AddRaw(this, &FNOSSceneTreeManager::OnNOSNodeSelected);
 	NOSClient->OnNOSConnectionClosed.AddRaw(this, &FNOSSceneTreeManager::OnNOSConnectionClosed);
@@ -473,10 +480,30 @@ bool FNOSSceneTreeManager::Tick(float dt)
 // renderer that is a visible hitch, and it lands whenever an operator first
 // touches a graphic, which is to say on air.
 //
-// Nothing about that work needs to wait for the asking. These two functions do
-// it up front instead, a few actors per frame, so the cost is paid in the
-// seconds after a level loads and every actor is ready before anyone reaches
-// for it.
+// Nothing about that work needs to wait for the asking. These functions do it
+// up front instead, a few actors per frame, so the cost is paid in the seconds
+// after a level loads and every actor is ready before anyone reaches for it.
+//
+// A trickle, and it has to stay a trickle. Going faster looks like it should
+// only move the same work earlier, and it does not - it changes what Nodos has
+// to do. Nodos resolves its graph once, early, against whatever the app has
+// given it by then. Left alone it syncs a couple of seconds after the scan,
+// having been handed only the hundred-odd nodes it actually asked for, and the
+// rest of the tree arrives behind it as small updates that cost nothing. Empty
+// the queue at a hundred milliseconds a frame instead and the whole tree - some
+// eighty-eight thousand pins - lands before that resolution runs, so it runs
+// against all of it: every one of those pins takes a ShowAs assignment, and the
+// app waits three and a half minutes to go live instead of two seconds.
+//
+// So the budget below is not politeness to the render thread. It is what keeps
+// the tree from arriving before Nodos is ready to be told about it. Raising it
+// makes loading slower, not faster.
+//
+// The draining also belongs here, in the tick, after the rescan has sent its
+// root update. That update carries CLEAR_NODES, so Nodos drops and rebuilds
+// every pin beneath it, and it is cheap only while the tree is still shallow.
+// Populating before it instead makes it carry the whole expanded graph, and a
+// show that streams levels rescans several times over.
 static TAutoConsoleVariable<int32> CVarBackgroundPopulate(
 	TEXT("Nodos.BackgroundPopulate"),
 	1,
@@ -484,32 +511,84 @@ static TAutoConsoleVariable<int32> CVarBackgroundPopulate(
 	TEXT("rather than when something first asks for one. 0 restores the old behaviour."));
 
 // How long a frame may spend on this. One actor is atomic and can overrun it, so
-// this bounds how many are started, not the worst frame. Kept small because the
-// engine is rendering while it works.
+// this bounds how many are started, not the worst frame. Kept small for the
+// reason above - it paces how fast the tree reaches Nodos - and incidentally
+// because the engine is rendering while it works.
 static TAutoConsoleVariable<float> CVarBackgroundPopulateMs(
 	TEXT("Nodos.BackgroundPopulateMsPerFrame"),
 	3.0f,
-	TEXT("Milliseconds per frame to spend building actors in the background."));
+	TEXT("Milliseconds per frame to spend building actors in the background. Raising this ")
+	TEXT("delays the app going live - see the comment above; it does not speed loading up."));
+
+// How long to wait for the app to go synced before building anyway. Only a
+// backstop - normally going synced arrives a second or two after the scan and
+// ends the wait long before this. It exists so a session that never syncs still
+// gets its actors built rather than silently falling back to building on first
+// touch.
+static TAutoConsoleVariable<float> CVarBackgroundPopulateHoldForSyncSeconds(
+	TEXT("Nodos.BackgroundPopulateHoldForSyncSeconds"),
+	60.0f,
+	TEXT("Seconds to hold background population waiting for the app to go synced. ")
+	TEXT("0 builds immediately, which delays going synced - see the comment above."));
+
+// Actors per outgoing message while draining. The batch exists to keep one
+// message per frame in the metered case; during an unbounded drain it also
+// keeps a whole scene's worth of updates from being handed to the transport as
+// a single oversized buffer.
+static constexpr int32 BackgroundPopulateMaxPerBatch = 64;
 
 void FNOSSceneTreeManager::QueueBackgroundPopulate()
 {
-	ActorsToBePopulated.Reset();
 	if (!CVarBackgroundPopulate.GetValueOnGameThread())
 		return;
 
+	// Whatever is still queued stays queued. A rescan does not invalidate it: an id
+	// whose node the rescan dropped simply finds nothing at pop time and costs a
+	// lookup, whereas clearing would silently strand actors that were queued by an
+	// attach or a spawn and are not reachable from the folder walk below.
 	for (auto& ChildNode : SceneTree.Root->Children)
 	{
 		CollectActorsToPopulate(ChildNode.Get());
 	}
 
-	BackgroundPopulateQueued = ActorsToBePopulated.Num();
-	BackgroundPopulateStartedAt = FPlatformTime::Seconds();
 	if (BackgroundPopulateQueued > 0)
 	{
 		UE_LOG(LogNOSSceneTreeManager, Display,
 			TEXT("Building %d actors in the background so nothing has to do it on air"),
 			BackgroundPopulateQueued);
 	}
+}
+
+// An actor Reality Hub spawns after the scan joins the same queue, so an
+// operator dragging a graphic in mid-show does not pay for building it the
+// first time they touch it. That is the whole of what this covers.
+//
+// Deliberately not every actor that appears late. Routing OnActorSpawned here
+// as well drags in everything the show's own blueprints spawn during load -
+// weather visualizers, map compositors, some fifty of them on this project -
+// and none of that is what anyone is about to reach for. It cost seconds of
+// load and a pile of pin traffic to build things nobody asked for. Those stay
+// lazy, as they were before any of this.
+void FNOSSceneTreeManager::QueueActorForBackgroundPopulate(ActorNode* Node)
+{
+	if (!Node || !CVarBackgroundPopulate.GetValueOnGameThread())
+	{
+		return;
+	}
+
+	bool bAlreadyQueued = false;
+	QueuedForPopulate.Add(Node->Id, &bAlreadyQueued);
+	if (bAlreadyQueued)
+	{
+		return;
+	}
+
+	if (BackgroundPopulateQueued == 0)
+	{
+		BackgroundPopulateStartedAt = FPlatformTime::Seconds();
+	}
+	ActorsToBePopulated.Add(Node->Id);
+	BackgroundPopulateQueued++;
 }
 
 // CollectActorsToPopulate walks the folders the scan produced, gathering the
@@ -519,9 +598,9 @@ void FNOSSceneTreeManager::CollectActorsToPopulate(TreeNode* Node)
 	if (!Node)
 		return;
 
-	if (Node->GetAsActorNode())
+	if (auto* ActorNodePtr = Node->GetAsActorNode())
 	{
-		ActorsToBePopulated.Add(Node->Id);
+		QueueActorForBackgroundPopulate(ActorNodePtr);
 		return;
 	}
 	for (auto& ChildNode : Node->Children)
@@ -537,37 +616,81 @@ void FNOSSceneTreeManager::TickBackgroundPopulate()
 	if (!CVarBackgroundPopulate.GetValueOnGameThread())
 	{
 		ActorsToBePopulated.Reset();
+		QueuedForPopulate.Reset();
+		BackgroundPopulateQueued = 0;
 		return;
 	}
 	// Nothing to send the updates to yet; the queue keeps until there is.
 	if (!NOSClient || !NOSClient->IsConnected())
 		return;
 
-	const double Budget = CVarBackgroundPopulateMs.GetValueOnGameThread() / 1000.0;
-	const double StartedAt = FPlatformTime::Seconds();
-
-	// One batch per frame, flushed the same way a LoadNodesOnPaths request is,
-	// so the engine sees the same events in the same order it would have.
-	FNodeUpdateBatch Batch;
-	int32 Built = 0;
-	while (!ActorsToBePopulated.IsEmpty() && FPlatformTime::Seconds() - StartedAt < Budget)
+	// And nothing is built until the app has been live once.
+	//
+	// Between connecting and going synced, Nodos is resolving its graph and
+	// deciding when to take the app live, and it will not do that while the app
+	// keeps handing it more tree. Feeding the queue through that window pushes
+	// going synced from two seconds after the scan out to fifty, and the whole
+	// load from 55 seconds to 107 - measured, and confirmed by turning population
+	// off entirely, which gives the 55 seconds back. Note that what is sent is
+	// identical either way, down to the pin; only the rate differs. Trickling it
+	// slowly enough to leave gaps happens to work and is what the old build did
+	// by accident, but it is a race, and this is the same thing won on purpose.
+	//
+	// Waiting costs nothing. Nothing can hitch before there is an air to hitch on,
+	// and the queue drains in the seconds after going live - long before an
+	// operator can reach for anything.
+	if (!bHasGoneLive)
 	{
-		const FGuid NodeId = ActorsToBePopulated.Pop(EAllowShrinking::No);
-		if (auto* Node = SceneTree.GetNode(NodeId))
-		{
-			PopulateNodeAndDirectDescendants(Node, &Batch);
-			Built++;
-		}
+		// Backstop for a session that never goes synced at all: an editor session,
+		// or a renderer that comes up without Nodos taking it live. Without this the
+		// queue would sit forever and every actor would go back to being built on
+		// first touch, which is the thing this exists to prevent.
+		const double HoldSeconds = FMath::Max(0.0, static_cast<double>(
+			CVarBackgroundPopulateHoldForSyncSeconds.GetValueOnGameThread()));
+		if (FPlatformTime::Seconds() - BackgroundPopulateStartedAt < HoldSeconds)
+			return;
 	}
 
-	if (!Batch.Events.empty())
+	const double Budget = CVarBackgroundPopulateMs.GetValueOnGameThread() / 1000.0;
+	const double StartedAt = FPlatformTime::Seconds();
+	auto HasTimeLeft = [&]()
 	{
+		return FPlatformTime::Seconds() - StartedAt < Budget;
+	};
+
+	// Batched and flushed the same way a LoadNodesOnPaths request is, so the
+	// engine sees the same events in the same order it would have.
+	auto Flush = [this](FNodeUpdateBatch& Batch)
+	{
+		if (Batch.Events.empty())
+			return;
 		auto batchOffset = nos::app::CreateBatchAppEventDirect(Batch.Builder, &Batch.Events);
 		auto appEventOffset = nos::CreateAppEventOffset(Batch.Builder, batchOffset);
 		Batch.Builder.Finish(appEventOffset);
 		auto buf = Batch.Builder.Release();
 		auto root = flatbuffers::GetRoot<nos::app::AppEvent>(buf.data());
 		NOSClient->AppServiceClient->Send(*root);
+	};
+
+	int32 Built = 0;
+	while (!ActorsToBePopulated.IsEmpty() && HasTimeLeft())
+	{
+		FNodeUpdateBatch Batch;
+		// The queue can still grow while it drains - populating an actor can spawn
+		// one - so this reads the count fresh rather than snapshotting it.
+		int32 InBatch = 0;
+		while (!ActorsToBePopulated.IsEmpty() && InBatch < BackgroundPopulateMaxPerBatch && HasTimeLeft())
+		{
+			const FGuid NodeId = ActorsToBePopulated.Pop(EAllowShrinking::No);
+			QueuedForPopulate.Remove(NodeId);
+			InBatch++;
+			if (auto* Node = SceneTree.GetNode(NodeId))
+			{
+				PopulateNodeAndDirectDescendants(Node, &Batch);
+				Built++;
+			}
+		}
+		Flush(Batch);
 	}
 
 	if (ActorsToBePopulated.IsEmpty() && BackgroundPopulateQueued > 0)
@@ -2364,10 +2487,17 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 		actorNode->actor->GetAttachedActors(ChildActors);
 		for (auto child : ChildActors)
 		{
+			// Added to the tree, deliberately not queued for population. Queuing here
+			// would make the build transitive - every child actor pulling in its own
+			// children - and a nested rig like a map compositor turns a scan of 77
+			// actors into 300, each one clearing and rebuilding its whole component
+			// subtree on the Nodos side. Child actors stay lazy, exactly as they were
+			// before any of this; the queue covers what the scan covers, plus actors
+			// that appear afterwards.
 			if(child->IsValidLowLevel() && !SceneTree.GetNode(child))
 			{
 				auto newActor = SceneTree.AddActor(actorNode, child);
-				if (ColoredChilds)
+				if (newActor && ColoredChilds)
 				{
 					newActor->nosMetaData.Add("NodeColor", HEXCOLOR_Reality_Node);
 				}
@@ -3474,6 +3604,10 @@ AActor* FNOSActorManager::SpawnActor(FString SpawnTag, NOSSpawnActorParameters P
 	ActorNode->nosMetaData.Add(NosMetadataKeys::NodeColor, HEXCOLOR_Reality_Node);
 	ActorNode->nosMetaData.Add({ NosMetadataKeys::ActorGuid, SpawnedActor->GetActorGuid().ToString()});
 	ActorNode->nosMetaData.Add(NosMetadataKeys::DoNotAttachToRealityParent, FString(Params.SpawnActorToWorldCoords ? "true" : "false"));
+	if (OnActorAddedToSceneTree)
+	{
+		OnActorAddedToSceneTree(ActorNode.Get());
+	}
 	
 	if (!NOSClient->IsConnected())
 	{
@@ -3541,6 +3675,10 @@ AActor* FNOSActorManager::SpawnUMGRenderManager(FString umgTag, UUserWidget* wid
 	ActorNode->nosMetaData.Add(NosMetadataKeys::umgTag, umgTag);
 	ActorNode->nosMetaData.Add(NosMetadataKeys::NodeColor, HEXCOLOR_Reality_Node);
 	ActorNode->nosMetaData.Add({ NosMetadataKeys::ActorGuid, UMGManager->GetActorGuid().ToString()});
+	if (OnActorAddedToSceneTree)
+	{
+		OnActorAddedToSceneTree(ActorNode.Get());
+	}
 
 
 	if (!NOSClient->IsConnected())
@@ -3631,6 +3769,10 @@ void FNOSActorManager::ReAddActorsToSceneTree()
 			for(auto [key, value] : SavedData.Metadata)
 			{
 				ActorNode->nosMetaData.Add(key, value);
+			}
+			if (OnActorAddedToSceneTree)
+			{
+				OnActorAddedToSceneTree(ActorNode.Get());
 			}
 		}
 		else
