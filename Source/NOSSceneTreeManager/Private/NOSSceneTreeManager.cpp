@@ -2274,8 +2274,99 @@ static bool IsTransformProperty(const FProperty* Property)
 	return Property && TransformPropertyNames.Contains(Property->GetFName());
 }
 
+// Properties that are editable, and that writing does nothing to.
+//
+// A pin write ends at FProperty::SetPropertyValue_InContainer, and the only
+// thing that runs afterwards is MarkState() - MarkRenderStateDirty and
+// UpdateComponentToWorld on the bound component. That covers anything the scene
+// proxy reads and anything transform-driven, which is most of what a component
+// exposes. It covers nothing else, and for an actor's own properties it does
+// not even run: BoundComponent is only ever set from a component, so a write to
+// an actor property changes the stored value and stops there.
+//
+// So these read back correctly in the graph and on the details panel, look
+// perfectly drivable, and quietly do nothing at all. Better absent than that.
+//
+// Three reasons a name is on this list, and only the first is fixable:
+//
+//   Setter-backed. bCanBeDamaged and InitialLifeSpan are the bHidden story
+//   again - the work lives in SetCanBeDamaged and SetLifeSpan. These could be
+//   routed through their setters the way visibility now is; they are here
+//   because nobody drives them live, so the pins are not worth the surface.
+//
+//   Read once, before anyone could reach the pin. Cook and level-load settings
+//   (bIsEditorOnlyActor, bIsSpatiallyLoaded, RuntimeGrid, HLOD, Lightmass) and
+//   spawn-time settings (SpawnCollisionHandlingMethod, AutoReceiveInput, the
+//   AutoAttach block). No setter would help; the moment has passed.
+//
+//   Needs state rebuilt that nothing here rebuilds. BodyInstance is the whole
+//   physics block - collision profile, simulate, mass, damping, solver counts -
+//   and it takes effect through RecreatePhysicsState and the collision setters.
+//   Denying the struct takes its ~106 child pins with it.
+//
+// Role and RemoteRole are the exception: they are network replication roles,
+// and driving them from a graph is a way to break replication rather than a
+// feature. Those are hidden because they should not be reachable, not because
+// they do not work.
+//
+// Not included, deliberately: the cloth properties. They are setter-backed and
+// would qualify, but there are only ten of them and this scene has a golf flag
+// among its skeletal meshes - not worth hiding something a show might be
+// driving to save ten pins.
+static TAutoConsoleVariable<int32> CVarHideInertProperties(
+	TEXT("Nodos.HideInertProperties"),
+	1,
+	TEXT("Hide properties that cannot take effect when written from a pin - cook and ")
+	TEXT("spawn-time settings, the physics block, and replication roles. 0 exposes them ")
+	TEXT("again, as stock; they still will not do anything."));
+
+static bool IsInertProperty(const FProperty* Property)
+{
+	static const TSet<FName> InertPropertyNames = {
+		// Setter-backed, and not driven live on this show.
+		FName(TEXT("bCanBeDamaged")),
+		FName(TEXT("InitialLifeSpan")),
+		// Cook, build and editor-only.
+		FName(TEXT("bIsEditorOnlyActor")),
+		FName(TEXT("bIsSpatiallyLoaded")),
+		FName(TEXT("bMigratingAsset")),
+		FName(TEXT("bNetLoadOnClient")),
+		FName(TEXT("bRelevantForLevelBounds")),
+		FName(TEXT("bIsMainWorldOnly")),
+		FName(TEXT("bCanBeInCluster")),
+		FName(TEXT("RuntimeGrid")),
+		FName(TEXT("bEnableAutoLODGeneration")),   // "Include Actor in HLOD"
+		FName(TEXT("SpriteScale")),                // "Editor Billboard Scale"
+		FName(TEXT("PivotOffset")),
+		FName(TEXT("LightmassSettings")),
+		// Read once when the actor spawns or the component activates.
+		FName(TEXT("SpawnCollisionHandlingMethod")),
+		FName(TEXT("AutoReceiveInput")),
+		FName(TEXT("InputPriority")),
+		FName(TEXT("bIgnoresOriginShifting")),
+		FName(TEXT("bAutoManageAttachment")),
+		FName(TEXT("AutoAttachParent")),
+		FName(TEXT("AutoAttachSocketName")),
+		FName(TEXT("AutoAttachLocationRule")),
+		FName(TEXT("AutoAttachRotationRule")),
+		FName(TEXT("AutoAttachScaleRule")),
+		FName(TEXT("bAutoAttachWeldSimulatedBodies")),
+		// Needs the physics state rebuilding; the struct's children go with it.
+		FName(TEXT("BodyInstance")),
+		// Replication roles - hidden so they cannot be driven, not because they are inert.
+		FName(TEXT("Role")),
+		FName(TEXT("RemoteRole")),
+	};
+	return Property && InertPropertyNames.Contains(Property->GetFName());
+}
+
 bool PropertyVisible(FProperty* ueproperty)
 {
+	if (CVarHideInertProperties.GetValueOnGameThread() && IsInertProperty(ueproperty))
+	{
+		return false;
+	}
+
 	return !ueproperty->HasAllPropertyFlags(CPF_DisableEditOnInstance) &&
 		!ueproperty->HasAllPropertyFlags(CPF_Deprecated) &&
 		//!ueproperty->HasAllPropertyFlags(CPF_EditorOnly) && //? dont know what this flag does but it hides more than necessary
