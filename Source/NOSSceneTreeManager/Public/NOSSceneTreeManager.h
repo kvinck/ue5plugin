@@ -185,6 +185,21 @@ public:
 	bool Tick(float dt);
 	bool CheckNewLevels(float dt);
 
+	// The streaming levels of the current world, in a stable order.
+	TArray<class ULevelStreaming*> GetStreamingLevels() const;
+	// The pin that drives a given level. Derived from the level's package name, so it is
+	// the same id every session and a graph saved today still names the same level.
+	static FGuid GetLevelPinId(FName PackageName);
+	// Whether the level is being asked for. Intent rather than the streaming state, so a
+	// checkbox reads back the moment it is ticked rather than when the level finishes.
+	bool IsStreamingLevelWanted(class ULevelStreaming* Level) const;
+	// Brings a level in or takes it out.
+	void SetStreamingLevelWanted(FName PackageName, bool bWanted);
+	// Applies the checkbox states carried by a reloaded graph.
+	void ApplySavedLevelPins(nos::fb::Node const& AppNode);
+	// Acts on the levels a loaded graph asked for, once it is safe to.
+	void TickPendingLevelRequests();
+
 	// Records a saved pin that could not be bound, so it can be bound later.
 	void StashPendingPinBinding(const struct PropUpdate& Update);
 	// Builds an actor and everything under it without telling Nodos yet, collecting the
@@ -464,6 +479,16 @@ public:
 	// inside this window is expected back, so its portals are parked as orphans rather
 	// than deleted - deleting them takes every connection Nodos holds with them.
 	bool bUnloadingLevel = false;
+
+	// Which level each checkbox on the Level Streaming node drives. Rebuilt every time
+	// that node is serialized: the set of streaming levels belongs to the map, and there
+	// is no map yet when the node is registered at startup.
+	TMap<FGuid, FName> LevelPinToPackage;
+	// What a loaded graph asked for, held until the app is up. Streaming a level in from
+	// inside the import itself lands in the middle of everything else that starts at that
+	// moment, and took Motion Design's broadcast down with it.
+	TMap<FName, bool> PendingLevelRequests;
+	double LevelRequestsQueuedAt = 0.0;
 
 	static TSet<FGuid> PropertiesNeeded;
 

@@ -374,6 +374,51 @@ void FNOSSceneTreeManager::StartupModule()
 		};
 		CustomFunctions.Add(noscf->Id, noscf);
 	}
+	// One checkbox per streaming level, live.
+	//
+	// The pins are built fresh every time this node is serialized rather than once at
+	// startup, because there is no world yet when this runs and the streaming list
+	// belongs to the map. Ticking a box does not go through the function below - the
+	// value change is routed straight to the level by OnNOSPinValueChanged - so the node
+	// never has to be triggered, and its pin values are saved into the graph like any
+	// other node's. Reloading that graph puts the levels back (ApplySavedLevelPins).
+	{
+		NOSCustomFunction* noscf = new NOSCustomFunction;
+		FString UniqueFunctionName("Level Streaming");
+		noscf->Id = StringToFGuid(UniqueFunctionName);
+
+		noscf->Serialize = [funcid = noscf->Id, this](flatbuffers::FlatBufferBuilder& fbb)->flatbuffers::Offset<nos::fb::Node>
+			{
+				LevelPinToPackage.Empty();
+				std::vector<flatbuffers::Offset<nos::fb::Pin>> LevelPins;
+				for (ULevelStreaming* Level : GetStreamingLevels())
+				{
+					const FName PackageName = Level->GetWorldAssetPackageFName();
+					const FGuid PinId = GetLevelPinId(PackageName);
+					LevelPinToPackage.Add(PinId, PackageName);
+
+					const FString ShortName = FPackageName::GetShortName(PackageName);
+					const FString ToolTip = FString::Printf(
+						TEXT("Load and show %s. Unticking it streams the level out; the pins of anything in it are kept and reconnect when it comes back."),
+						*PackageName.ToString());
+					std::vector<uint8_t> LoadedData;
+					LoadedData.push_back(IsStreamingLevelWanted(Level) ? 1 : 0);
+
+					LevelPins.push_back(nos::fb::CreatePinDirect(fbb, (nos::fb::UUID*)&PinId,
+						TCHAR_TO_UTF8(*ShortName), "bool",
+						nos::fb::ShowAs::PROPERTY, nos::fb::CanShowAs::PROPERTY_ONLY, "Levels",
+						0, &LoadedData, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+						nos::fb::PinContents::JobPin, 0, 0,
+						nos::fb::PinValueDisconnectBehavior::KEEP_LAST_VALUE,
+						TCHAR_TO_UTF8(*ToolTip)));
+				}
+				return nos::fb::CreateNodeDirect(fbb, (nos::fb::UUID*)&funcid, "Level Streaming", "UE5.UE5", true, &LevelPins, 0, nos::fb::NodeContents::Job, nos::fb::CreateJob(fbb).Union(), TCHAR_TO_ANSI(*FNOSClient::AppKey), 0, "Control"
+				, 0, false, nullptr, 0, "Which levels this map streams in. Ticking a box loads a level and unticking it unloads one, as you do it.");
+			};
+		// Nothing to do on a trigger: the checkboxes act as they are ticked.
+		noscf->Function = [](TMap<FGuid, std::vector<uint8>> properties) {};
+		CustomFunctions.Add(noscf->Id, noscf);
+	}
 	{
 		NOSCustomFunction* noscf = new NOSCustomFunction;
 		FString UniqueFunctionName("Reload Level");
@@ -469,6 +514,7 @@ bool FNOSSceneTreeManager::Tick(float dt)
 		bTwoWayBindingStatusSent = false;
 	}
 
+	TickPendingLevelRequests();
 	TickBackgroundPopulate();
 	TickPendingPinBindings();
 	return true;
@@ -812,6 +858,16 @@ void FNOSSceneTreeManager::OnNOSConnectionClosed()
 void FNOSSceneTreeManager::OnNOSPinValueChanged(nos::fb::UUID const& pinId, uint8_t const* data, size_t size, bool reset)
 {
 	FGuid Id = *(FGuid*)&pinId;
+	// A checkbox on the Level Streaming node. Handled here rather than through a function
+	// call so the level goes in or out as the box is ticked.
+	if (const FName* PackageName = LevelPinToPackage.Find(Id))
+	{
+		if (size > 0)
+		{
+			SetStreamingLevelWanted(*PackageName, data[0] != 0);
+		}
+		return;
+	}
 	if (CustomProperties.Contains(Id))
 	{
 		auto nosprop = CustomProperties.FindRef(Id);
@@ -1502,6 +1558,11 @@ void FNOSSceneTreeManager::OnNOSNodeImported(nos::fb::Node const& appNode)
 	FNOSClient::NodeId = *(FGuid*)appNode.id();
 	SceneTree.Root->Id = FNOSClient::NodeId;
 
+	// First, so the levels this graph wants are already streaming in while the rest of it
+	// is resolved. Anything in them lands too late to be bound by the passes below, which
+	// is exactly what the pending bindings are for.
+	ApplySavedLevelPins(appNode);
+
 	auto node = &appNode;
 
 	std::vector<flatbuffers::Offset<nos::PartialPinUpdate>> PinUpdates;
@@ -2191,6 +2252,212 @@ void FNOSSceneTreeManager::OnNOSNodeImported(nos::fb::Node const& appNode)
 	}
 	//SendSyncSemaphores(true);
 	LOG("Node from Nodos successfully imported");
+}
+
+// The name the pin is built from, and the one shown on it. The package name is what makes
+// the pin id stable across sessions; the short name is what an operator reads.
+static FString GetLevelPackageString(ULevelStreaming* Level)
+{
+	return Level ? Level->GetWorldAssetPackageFName().ToString() : FString();
+}
+
+TArray<ULevelStreaming*> FNOSSceneTreeManager::GetStreamingLevels() const
+{
+	TArray<ULevelStreaming*> Levels;
+	if (!IsValid(daWorld))
+	{
+		return Levels;
+	}
+
+	for (ULevelStreaming* Level : daWorld->GetStreamingLevels())
+	{
+		if (IsValid(Level) && !Level->GetWorldAssetPackageFName().IsNone())
+		{
+			Levels.Add(Level);
+		}
+	}
+
+	// Sorted by package name rather than left in the world's order, so the checkboxes do
+	// not reshuffle themselves when the map's streaming list is edited.
+	Levels.Sort([](ULevelStreaming const& A, ULevelStreaming const& B)
+	{
+		return A.GetWorldAssetPackageFName().LexicalLess(B.GetWorldAssetPackageFName());
+	});
+	return Levels;
+}
+
+FGuid FNOSSceneTreeManager::GetLevelPinId(FName PackageName)
+{
+	return StringToFGuid(FString("Level Streaming") + PackageName.ToString());
+}
+
+bool FNOSSceneTreeManager::IsStreamingLevelWanted(ULevelStreaming* Level) const
+{
+	return IsValid(Level) && Level->ShouldBeLoaded() && Level->ShouldBeVisible();
+}
+
+void FNOSSceneTreeManager::SetStreamingLevelWanted(FName PackageName, bool bWanted)
+{
+	if (!IsValid(daWorld))
+	{
+		return;
+	}
+
+	for (ULevelStreaming* Level : daWorld->GetStreamingLevels())
+	{
+		if (!IsValid(Level) || Level->GetWorldAssetPackageFName() != PackageName)
+		{
+			continue;
+		}
+		if (IsStreamingLevelWanted(Level) == bWanted)
+		{
+			return;
+		}
+		// Asking rather than doing: the level streams in or out over the following frames,
+		// and the actors arriving or leaving are what drive the pin reconnection. Going
+		// through UGameplayStatics instead would do the same thing behind a latent action.
+		Level->SetShouldBeLoaded(bWanted);
+		Level->SetShouldBeVisible(bWanted);
+		UE_LOG(LogNOSSceneTreeManager, Display, TEXT("%s %s"),
+			bWanted ? TEXT("Loading") : TEXT("Unloading"), *PackageName.ToString());
+		return;
+	}
+
+	UE_LOG(LogNOSSceneTreeManager, Warning,
+		TEXT("The graph asks for level %s, which this map does not stream"), *PackageName.ToString());
+}
+
+void FNOSSceneTreeManager::ApplySavedLevelPins(nos::fb::Node const& AppNode)
+{
+	// Read straight out of the imported graph rather than waiting for Nodos to push each
+	// checkbox down: this runs before anything else in the import, so the levels a show
+	// wants are already streaming in while the rest of the graph is being resolved, and
+	// their pins reconnect as they arrive like any other late level.
+	//
+	// Matched by recomputing each level's pin id from its package name, so it does not
+	// depend on the node having been serialized yet this session.
+	TArray<ULevelStreaming*> Levels = GetStreamingLevels();
+	if (Levels.IsEmpty())
+	{
+		return;
+	}
+
+	TMap<FGuid, ULevelStreaming*> LevelsByPinId;
+	for (ULevelStreaming* Level : Levels)
+	{
+		LevelsByPinId.Add(GetLevelPinId(Level->GetWorldAssetPackageFName()), Level);
+	}
+
+	int32 Applied = 0;
+	TFunction<void(const nos::fb::Node*)> Visit = [&](const nos::fb::Node* Node)
+	{
+		if (!Node)
+		{
+			return;
+		}
+		if (Node->pins())
+		{
+			for (auto const* Pin : *Node->pins())
+			{
+				if (!Pin || !Pin->id() || !flatbuffers::IsFieldPresent(Pin, nos::fb::Pin::VT_DATA) || Pin->data()->size() == 0)
+				{
+					continue;
+				}
+				auto* Level = LevelsByPinId.Find(*(FGuid*)Pin->id());
+				if (!Level)
+				{
+					continue;
+				}
+				const bool bWanted = Pin->data()->Get(0) != 0;
+				if (IsStreamingLevelWanted(*Level) != bWanted)
+				{
+					// Queued rather than acted on. See TickPendingLevelRequests.
+					PendingLevelRequests.Add((*Level)->GetWorldAssetPackageFName(), bWanted);
+					Applied++;
+				}
+			}
+		}
+		// Null for anything that is not a graph, and every function node is a Job - so
+		// this has to be checked rather than handed to IsFieldPresent, which dereferences
+		// what it is given. The other walkers in this file get away with the shorter form
+		// only because none of them descend into a function.
+		if (auto const* Graph = Node->contents_as_Graph())
+		{
+			if (Graph->nodes())
+			{
+				for (auto const* Child : *Graph->nodes())
+				{
+					Visit(Child);
+				}
+			}
+		}
+		// And the function nodes, which is where this one actually lives. A node
+		// registered in CustomFunctions is serialized into the parent's functions list,
+		// not into its graph contents, so walking only the child nodes never reaches it -
+		// and every checkbox in a saved graph was silently ignored.
+		if (Node->functions())
+		{
+			for (auto const* Function : *Node->functions())
+			{
+				Visit(Function);
+			}
+		}
+	};
+	Visit(&AppNode);
+
+	if (Applied > 0)
+	{
+		LevelRequestsQueuedAt = FPlatformTime::Seconds();
+		UE_LOG(LogNOSSceneTreeManager, Display,
+			TEXT("The loaded graph asks for %d level change(s); holding them until the app is up"), Applied);
+	}
+}
+
+// How long to wait for the app to go live before streaming the graph's levels anyway.
+//
+// Not politeness. Importing a graph happens while everything else that starts with the
+// app is still starting - on this project Motion Design's broadcast is coming up in the
+// same breath - and a level streaming in underneath that took the whole editor down with
+// an out-of-bounds read inside AvalancheMedia. Unticking the level made the crash go
+// away, which is as close to proof as this gets without the other plugin's source.
+//
+// Going live is the signal already used to decide the app has finished arriving, and it
+// lands a second or two after the scan. Waiting for it costs a fraction of what this
+// feature saves: the show used to load all twenty-five levels and eject the ones it did
+// not want, and now it loads the ones a graph asks for, a moment later than it could.
+//
+// 0 streams them the instant the graph is read, as it did before, and takes the crash
+// back with it.
+static TAutoConsoleVariable<float> CVarLevelRequestHoldForSyncSeconds(
+	TEXT("Nodos.LevelRequestHoldForSyncSeconds"),
+	60.0f,
+	TEXT("Seconds to hold the levels a loaded graph asks for, waiting for the app to go ")
+	TEXT("live. They stream as soon as it does; this is only the backstop for a session ")
+	TEXT("that never syncs. 0 streams them immediately."));
+
+void FNOSSceneTreeManager::TickPendingLevelRequests()
+{
+	if (PendingLevelRequests.IsEmpty())
+	{
+		return;
+	}
+
+	const double HoldSeconds = FMath::Max(0.0, static_cast<double>(
+		CVarLevelRequestHoldForSyncSeconds.GetValueOnGameThread()));
+	// Live is the ordinary way out of here. The elapsed check is the backstop for a
+	// session that never syncs - an editor session, or a renderer Nodos never takes live -
+	// so the levels a graph asks for still arrive rather than never being streamed at all.
+	if (!bHasGoneLive && HoldSeconds > 0.0 && FPlatformTime::Seconds() - LevelRequestsQueuedAt < HoldSeconds)
+	{
+		return;
+	}
+
+	TMap<FName, bool> Requests = MoveTemp(PendingLevelRequests);
+	PendingLevelRequests.Reset();
+	for (auto const& [PackageName, bWanted] : Requests)
+	{
+		SetStreamingLevelWanted(PackageName, bWanted);
+	}
 }
 
 void FNOSSceneTreeManager::StashPendingPinBinding(const PropUpdate& Update)
