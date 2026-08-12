@@ -470,6 +470,7 @@ bool FNOSSceneTreeManager::Tick(float dt)
 	}
 
 	TickBackgroundPopulate();
+	TickPendingPinBindings();
 	return true;
 }
 
@@ -1153,6 +1154,11 @@ void FNOSSceneTreeManager::OnLevelRemovedFromWorld(ULevel* Level, UWorld* World)
 
 	bool backupAlwaysUpdateOnActorSpawns = AlwaysUpdateOnActorSpawns;
 	AlwaysUpdateOnActorSpawns = true;
+	// These actors are being streamed out, not deleted. Tells SendActorNodeDeleted to
+	// park their portals as orphans instead of destroying them, which is what takes
+	// every connection Nodos holds with them.
+	bool backupUnloadingLevel = bUnloadingLevel;
+	bUnloadingLevel = true;
 
 	for (auto Actor : Level->Actors)
 	{
@@ -1163,6 +1169,7 @@ void FNOSSceneTreeManager::OnLevelRemovedFromWorld(ULevel* Level, UWorld* World)
 		}
 	}
 	AlreadyLoadedStreamingLevels.Remove(Level);
+	bUnloadingLevel = backupUnloadingLevel;
 	AlwaysUpdateOnActorSpawns = backupAlwaysUpdateOnActorSpawns;
 }
 
@@ -1686,10 +1693,46 @@ void FNOSSceneTreeManager::OnNOSNodeImported(nos::fb::Node const& appNode)
 		}
 	}
 
+	// Keep every saved pin whose actor is not in the world at this instant. On this show
+	// that is a streaming level the map has not loaded yet, and both passes below skip
+	// what they cannot find - which is the whole reason a level loaded after launch used
+	// to come back with no connections. Stashing them costs nothing and lets the level
+	// arrive whenever it likes.
+	//
+	// Emptied first: an import replaces the graph, so bindings kept for the previous one
+	// name pins Nodos is no longer holding.
+	PendingPinBindings.Empty();
+	PendingBindingActorsToResolve.Empty();
+	SavedPinValues.Empty();
+	for (auto const& update : updates)
+	{
+		// Every pin's value, not just the ones being stashed. A level loaded now can be
+		// streamed out later, and when it comes back the graph's value is what it should
+		// read - by which time the buffers this was copied from are long gone.
+		if (update.newVal && update.newValSize > 0)
+		{
+			TArray<uint8>& SavedValue = SavedPinValues.Add(update.pinId);
+			SavedValue.Append(static_cast<const uint8*>(update.newVal), update.newValSize);
+		}
+		if (!sceneActorMap.Contains(update.actorId))
+		{
+			StashPendingPinBinding(update);
+		}
+	}
+	if (!PendingPinBindings.IsEmpty())
+	{
+		int32 PendingPins = 0;
+		for (auto const& [_, Bindings] : PendingPinBindings)
+			PendingPins += Bindings.Num();
+		UE_LOG(LogNOSSceneTreeManager, Display,
+			TEXT("%d saved pin(s) across %d actor(s) are not in the world yet; they will be reconnected when their level loads"),
+			PendingPins, PendingPinBindings.Num());
+	}
+
 	for (auto const& update : updates)
 	{
 		FGuid ActorId = update.actorId;
-		
+
 		UObject* Container = nullptr;
 		if (sceneActorMap.Contains(ActorId))
 		{
@@ -2148,6 +2191,372 @@ void FNOSSceneTreeManager::OnNOSNodeImported(nos::fb::Node const& appNode)
 	}
 	//SendSyncSemaphores(true);
 	LOG("Node from Nodos successfully imported");
+}
+
+void FNOSSceneTreeManager::StashPendingPinBinding(const PropUpdate& Update)
+{
+	if (!Update.actorId.IsValid())
+	{
+		return;
+	}
+
+	FPendingPinBinding Binding;
+	Binding.PinId = Update.pinId;
+	Binding.ComponentName = Update.componentName;
+	Binding.PropertyPath = Update.PropertyPath;
+	Binding.ContainerPath = Update.ContainerPath;
+	Binding.DisplayName = Update.displayName;
+	Binding.FunctionName = Update.FunctionName;
+	Binding.FunctionPropertyName = Update.FunctionPropertyName;
+	Binding.PinShowAs = Update.pinShowAs;
+	Binding.IsPortal = Update.IsPortal;
+	// Copied out: the import frees both buffers before it returns.
+	if (Update.newVal && Update.newValSize > 0)
+	{
+		Binding.Value.Append(static_cast<const uint8*>(Update.newVal), Update.newValSize);
+	}
+	if (Update.defVal && Update.defValSize > 0)
+	{
+		Binding.DefaultValue.Append(static_cast<const uint8*>(Update.defVal), Update.defValSize);
+	}
+
+	PendingPinBindings.FindOrAdd(Update.actorId).Add(MoveTemp(Binding));
+}
+
+void FNOSSceneTreeManager::PopulateActorSubtreeDeferred(TreeNode* Node, TArray<FGuid>& OutNodesToSend)
+{
+	if (!Node)
+	{
+		return;
+	}
+
+	if (PopulateNode(Node))
+	{
+		OutNodesToSend.Add(Node->Id);
+	}
+
+	// Copied before walking: populating a node appends the component nodes it finds to
+	// this one's children, and the recursion below populates as it goes.
+	std::vector<TSharedPtr<TreeNode>> Children = Node->Children;
+	for (auto& ChildNode : Children)
+	{
+		if (ChildNode && (ChildNode->GetAsActorNode() || ChildNode->GetAsSceneComponentNode()))
+		{
+			PopulateActorSubtreeDeferred(ChildNode.Get(), OutNodesToSend);
+		}
+	}
+}
+
+bool FNOSSceneTreeManager::ResolvePendingPinBinding(AActor* Actor, FPendingPinBinding const& Binding, FResolvedPinBinding& OutResolved)
+{
+	if (!IsValid(Actor))
+	{
+		return false;
+	}
+
+	// The same walk the import does, against an actor that exists this time.
+	UObject* Container = Actor;
+	if (!Binding.ComponentName.IsEmpty())
+	{
+		Container = FindObject<USceneComponent>(Actor, *Binding.ComponentName);
+	}
+	if (!Container)
+	{
+		return false;
+	}
+
+	void* UnknownContainer = Container;
+	if (!Binding.ContainerPath.IsEmpty())
+	{
+		bool bDiscard;
+		UnknownContainer = FindContainerFromContainerPath(Container, Binding.ContainerPath, bDiscard);
+	}
+	if (!UnknownContainer)
+	{
+		return false;
+	}
+
+	TSharedPtr<NOSProperty> NosProperty = nullptr;
+	if (Binding.FunctionName.IsEmpty())
+	{
+		FProperty* PropertyToUpdate = FindFProperty<FProperty>(*Binding.PropertyPath);
+		if (!PropertyToUpdate)
+		{
+			return false;
+		}
+		NosProperty = NOSPropertyManager.PropertiesByPropertyAndContainer.FindRef({PropertyToUpdate, UnknownContainer});
+	}
+	else
+	{
+		UFunction* UEFunction = Actor->FindFunction(FName(Binding.FunctionName));
+		auto* Found = NOSPropertyManager.FunctionsByContainerAndUEFunction.Find({UnknownContainer, UEFunction});
+		if (!Found)
+		{
+			return false;
+		}
+		for (auto& Param : (*Found)->Properties)
+		{
+			const bool bMatches = Param->Property
+				? Param->Property->GetFName().ToString() == Binding.FunctionPropertyName
+				: (Param->DisplayName == Binding.FunctionPropertyName ||
+					Param->nosMetaDataMap.FindRef(NosMetadataKeys::FunctionPropertyName) == Binding.FunctionPropertyName);
+			if (bMatches)
+			{
+				NosProperty = Param;
+				break;
+			}
+		}
+	}
+	if (!NosProperty)
+	{
+		return false;
+	}
+
+	// Without this the property is filtered back out of everything sent from here on.
+	PropertiesNeeded.Add(NosProperty->Id);
+
+	if (!Binding.Value.IsEmpty())
+	{
+		NosProperty->SetPropValue((void*)Binding.Value.GetData(), Binding.Value.Num());
+	}
+	if (!Binding.DisplayName.IsEmpty())
+	{
+		NosProperty->DisplayName = Binding.DisplayName;
+	}
+	NosProperty->UpdatePinValue();
+	if (!Binding.DefaultValue.IsEmpty())
+	{
+		NosProperty->default_val = std::vector<uint8>(
+			Binding.DefaultValue.GetData(), Binding.DefaultValue.GetData() + Binding.DefaultValue.Num());
+	}
+
+	OutResolved.Property = NosProperty;
+	OutResolved.ShowAs = Binding.PinShowAs;
+	OutResolved.bValueApplied = !Binding.Value.IsEmpty();
+
+	if (!Binding.IsPortal)
+	{
+		return true;
+	}
+
+	// The saved graph is wired to Binding.PinId, and CreatePortal always derives the
+	// portal's id from the source property's. If those disagree, the pin about to be
+	// created is not the one Nodos is holding a connection to, and adding it would put
+	// a second, unconnected pin on the node. Say so and leave the original orphaned.
+	const FGuid PortalId = StringToFGuid(NosProperty->Id.ToString());
+	if (PortalId != Binding.PinId)
+	{
+		UE_LOG(LogNOSSceneTreeManager, Warning,
+			TEXT("Saved pin %s on %s now hashes to %s, so it cannot be reconnected; leaving it orphaned rather than adding a pin nothing is wired to"),
+			*Binding.PinId.ToString(), *Actor->GetActorLabel(), *PortalId.ToString());
+		return true;
+	}
+
+	NosProperty->PinShowAs = Binding.PinShowAs;
+	OutResolved.bWantsPortal = true;
+	return true;
+}
+
+// Whether to also push the value at Nodos after binding, on top of the node update that
+// already carries it.
+//
+// Redundant in the ordinary case: the node update is held back until the values are
+// applied, so the first thing Nodos hears about one of these pins already reads
+// correctly. It earns its place in the case where nothing was built - an actor the
+// background queue or a LoadNodesOnPaths request reached before this pass, so
+// PopulateNode returns false and no node update is sent. There Nodos is still holding
+// whatever it was told when the actor was populated, and this is the only thing that
+// corrects it.
+//
+// It was briefly suspected of making a reconnected pin inert - right value, would not
+// take an edit, reverted on reselect - because turning it off and sending the
+// orphan-state activation below went in together. Retested with it back on: the pin
+// stays correct and editable, so the activation was the fix and this is harmless. Kept
+// as a switch rather than removed, like the rest of the knobs in this file, so it can be
+// ruled out from the console mid-show instead of by a rebuild.
+static TAutoConsoleVariable<int32> CVarNotifyReconnectedPinValue(
+	TEXT("Nodos.NotifyReconnectedPinValue"),
+	1,
+	TEXT("Send a pin value notification after reconnecting a saved pin, in addition to the ")
+	TEXT("node update that already carries the value. 0 disables it; the value then relies ")
+	TEXT("on the node update alone, which is not sent for an already-populated actor."));
+
+void FNOSSceneTreeManager::TickPendingPinBindings()
+{
+	if (PendingBindingActorsToResolve.IsEmpty())
+	{
+		return;
+	}
+	// Nothing to send a reconnected pin to yet; the queue keeps until there is.
+	if (!NOSClient || !NOSClient->IsConnected())
+	{
+		return;
+	}
+
+	TArray<FGuid> ToResolve = MoveTemp(PendingBindingActorsToResolve);
+	PendingBindingActorsToResolve.Reset();
+
+	for (FGuid const& ActorId : ToResolve)
+	{
+		if (!PendingPinBindings.Contains(ActorId))
+		{
+			continue;
+		}
+
+		auto* Node = SceneTree.GetNodeFromActorId(ActorId);
+		AActor* Actor = Node ? Node->actor.Get() : nullptr;
+		if (!IsValid(Actor))
+		{
+			// Keep the bindings. The actor may still be on its way in, and it costs a
+			// lookup to find that out again next time one arrives.
+			continue;
+		}
+
+		// Three phases, and the order is the whole point.
+		//
+		// Building an actor is what creates its properties, and the ordinary build sends
+		// each node to Nodos as it finishes - carrying whatever value the level was
+		// authored with, because the saved value cannot be applied to a property that
+		// does not exist yet. Nodos is then holding the level's value, the actor is moved
+		// to the saved one a moment later, and the two never agree again: the prop sits
+		// where the operator put it while the numbers beside it read the level's.
+		//
+		// So: build without sending, apply the saved values, and only then send. What
+		// Nodos hears first is already correct. Portals go last because a portal names
+		// its source pin, and that pin has to have been sent before something points at
+		// it.
+
+		// Phase 1: build, send nothing.
+		TArray<FGuid> NodesToSend;
+		PopulateActorSubtreeDeferred(Node, NodesToSend);
+
+		// Phase 2: apply the saved values, while Nodos still knows nothing about them.
+		TArray<FPendingPinBinding> Bindings;
+		PendingPinBindings.RemoveAndCopyValue(ActorId, Bindings);
+
+		TArray<FPendingPinBinding> Unresolved;
+		TArray<FResolvedPinBinding> ResolvedBindings;
+		for (auto& Binding : Bindings)
+		{
+			FResolvedPinBinding ResolvedBinding;
+			if (ResolvePendingPinBinding(Actor, Binding, ResolvedBinding))
+			{
+				ResolvedBindings.Add(MoveTemp(ResolvedBinding));
+			}
+			else
+			{
+				Unresolved.Add(MoveTemp(Binding));
+			}
+		}
+
+		if (!Unresolved.IsEmpty())
+		{
+			PendingPinBindings.Add(ActorId, MoveTemp(Unresolved));
+		}
+
+		// Phase 3: tell Nodos, now that the pins carry the right values.
+		for (FGuid const& NodeId : NodesToSend)
+		{
+			SendNodeUpdate(NodeId, true, false);
+		}
+
+		TArray<TPair<FGuid, FGuid>> PortalsToActivate; // portal id, source property id
+		for (auto& ResolvedBinding : ResolvedBindings)
+		{
+			if (!ResolvedBinding.Property)
+			{
+				continue;
+			}
+			if (ResolvedBinding.bValueApplied && CVarNotifyReconnectedPinValue.GetValueOnGameThread())
+			{
+				SendPinValueChanged(ResolvedBinding.Property->Id, ResolvedBinding.Property->data);
+			}
+			if (ResolvedBinding.bWantsPortal)
+			{
+				const FGuid PortalId = StringToFGuid(ResolvedBinding.Property->Id.ToString());
+				NOSPropertyManager.CreatePortal(ResolvedBinding.Property->Id, ResolvedBinding.ShowAs);
+				// CreatePortal declines at Verbose - the property not registered, or unable
+				// to show as what the graph asked for - and a portal that was not created is
+				// a pin that stays orphaned and inert while still drawing a value, because
+				// the portal Nodos already holds carries its own copy of it. That failure
+				// looks exactly like success until someone tries to drag the pin, so it
+				// gets a line at a level that appears in an ordinary log.
+				if (!NOSPropertyManager.PortalPinsById.Contains(PortalId))
+				{
+					UE_LOG(LogNOSSceneTreeManager, Warning,
+						TEXT("Portal %s for %s was not created; the pin keeps its value but stays orphaned and will not accept edits"),
+						*PortalId.ToString(), *ResolvedBinding.Property->DisplayName);
+					continue;
+				}
+				PortalsToActivate.Emplace(PortalId, ResolvedBinding.Property->Id);
+			}
+		}
+
+		// Take the pin out of the orphan state and point it at the property it just found.
+		//
+		// Importing a node blanket-orphans every saved pin before it tries to resolve any
+		// of them, and an orphan pin is inert: it draws its value but will not take an
+		// edit, will not reset, and reverts to whatever the app last serialized the moment
+		// the node is reselected. The import clears the flag for pins it resolves itself;
+		// pins resolved out here have to say the same thing, and CreatePortal cannot say
+		// it - the portal it serializes leaves orphan_state unset, so Nodos keeps whatever
+		// it had. This is the same update the import and a world change both send.
+		if (!PortalsToActivate.IsEmpty() && NOSClient->IsConnected())
+		{
+			flatbuffers::FlatBufferBuilder mb;
+			std::vector<flatbuffers::Offset<nos::PartialPinUpdate>> PinUpdates;
+			for (auto const& [PortalId, SourceId] : PortalsToActivate)
+			{
+				PinUpdates.push_back(nos::CreatePartialPinUpdate(mb,
+					(nos::fb::UUID*)&PortalId, (nos::fb::UUID*)&SourceId,
+					nos::fb::CreatePinOrphanStateDirect(mb, nos::fb::PinOrphanStateType::ACTIVE)));
+			}
+			auto offset = nos::CreatePartialNodeUpdateDirect(mb, (nos::fb::UUID*)&FNOSClient::NodeId,
+				nos::ClearFlags::NONE, 0, 0, 0, 0, 0, 0, 0, &PinUpdates);
+			mb.Finish(offset);
+			auto buf = mb.Release();
+			auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
+			NOSClient->AppServiceClient->SendPartialNodeUpdate(*root);
+
+			// And refresh each portal's metadata, which is what the import does after
+			// creating portals of its own and the only thing it does that this did not.
+			//
+			// It matters here more than it does there: these pins already exist on the
+			// Nodos side - parked as orphans rather than deleted - so if a pin add for an
+			// id Nodos already knows is treated as nothing to do, the update above is all
+			// that lands, and it carries only the source id and the orphan state. The
+			// metadata a write is routed by would then still describe the property that
+			// was destroyed with the level.
+			for (auto const& [PortalId, SourceId] : PortalsToActivate)
+			{
+				auto SourceProperty = NOSPropertyManager.PropertiesById.FindRef(SourceId);
+				if (!SourceProperty)
+				{
+					continue;
+				}
+				flatbuffers::FlatBufferBuilder mbMeta;
+				auto UpdatedMetadata = SourceProperty->SerializeMetaData(mbMeta);
+				auto metaOffset = nos::CreateAppEventOffset(mbMeta,
+					nos::app::CreatePinMetadataUpdateDirect(mbMeta, (nos::fb::UUID*)&PortalId, &UpdatedMetadata, true));
+				mbMeta.Finish(metaOffset);
+				auto metaBuf = mbMeta.Release();
+				auto metaRoot = flatbuffers::GetRoot<nos::app::AppEvent>(metaBuf.data());
+				NOSClient->AppServiceClient->Send(*metaRoot);
+			}
+		}
+
+		if (!ResolvedBindings.IsEmpty())
+		{
+			// The two counts are what separate the ways this goes wrong. Nodes of 0 means
+			// nothing was built here, so no pin carrying the value reached Nodos and the
+			// portal has nothing behind it to drive - which reads as a pin that shows the
+			// right number and ignores every edit. Activated short of portals means the
+			// orphan state was left on.
+			UE_LOG(LogNOSSceneTreeManager, Display,
+				TEXT("Reconnected %d saved pin(s) on %s: %d node update(s) held back until values were applied, %d portal(s) activated"),
+				ResolvedBindings.Num(), *Actor->GetActorLabel(), NodesToSend.Num(), PortalsToActivate.Num());
+		}
+	}
 }
 
 void FNOSSceneTreeManager::SetPropertyValue(FGuid pinId, void* newval, size_t size)
@@ -2754,6 +3163,20 @@ bool FNOSSceneTreeManager::PopulateNode(TreeNode* treeNode)
 	else if (treeNode->GetAsSceneComponentNode())
 	{
 		auto Component = treeNode->GetAsSceneComponentNode()->sceneComponent;
+		// Nothing to build without a component, and two ordinary things arrive here
+		// without one. AddActor hangs a placeholder node called "Loading" under every new
+		// actor node, and that node carries no component at all; and a level that has been
+		// streamed out leaves nodes whose components have since been collected. Both still
+		// have NeedsReload set, so neither is stopped by the check at the top, and
+		// PopulateNodeAndDirectDescendants walks an actor's children whether or not the
+		// actor itself populated - so a bailed-out parent leads straight here.
+		//
+		// The actor branch above has always guarded for this. This one never did, and
+		// streaming levels in and out is what made it reachable.
+		if (!IsValid(Component.Get()))
+		{
+			return false;
+		}
 		auto Actor = Component->GetOwner();
 		auto ComponentNode = treeNode->GetAsSceneComponentNode();
 		auto ComponentClass = Component->GetClass();
@@ -3058,6 +3481,14 @@ void FNOSSceneTreeManager::SendActorAdded(AActor* actor, FString spawnTag)
 		return;
 	}
 
+	// A saved graph named this actor while it was not in the world - a level that has
+	// only now streamed in, or one that was streamed out and is back. Its pins can be
+	// bound once the node below exists, which the tick is late enough to assume.
+	if (PendingPinBindings.Contains(actor->GetActorGuid()))
+	{
+		PendingBindingActorsToResolve.AddUnique(actor->GetActorGuid());
+	}
+
 	TSharedPtr<ActorNode> newNode = nullptr;
 	if (auto sceneParent = actor->GetSceneOutlinerParent())
 	{
@@ -3178,6 +3609,12 @@ void FNOSSceneTreeManager::SendActorNodeDeleted(ActorNode* node)
 	if (!node)
 		return;
 
+	// An actor being streamed out is coming back under the same guid, so its portals are
+	// parked rather than destroyed. The guid is read from the node because the actor
+	// reference is weak and is often already gone by the time this runs.
+	const FGuid ParkedUnderActorGuid = node->RegisteredActorGuid;
+	const bool bParkPortals = bUnloadingLevel && ParkedUnderActorGuid.IsValid();
+
 	//delete properties
 	// can be optimized by using raw pointers
 	TSet<TSharedPtr<NOSProperty>> propertiesToRemove;
@@ -3202,6 +3639,30 @@ void FNOSSceneTreeManager::SendActorNodeDeleted(ActorNode* node)
 			continue;
 		}
 		PortalsToRemove.Add(portalId);
+
+		// Streamed out rather than deleted: keep what this portal was bound to, so the
+		// same pin can be rebuilt against the same property when the level comes back.
+		//
+		// The value carried across is the graph's, not the one the property happens to
+		// hold right now. A level that cycles is expected to come back reading what the
+		// show has saved for it, so an adjustment made and not saved is dropped by the
+		// cycle rather than quietly outliving it - and the level's own authored value,
+		// which is what the property reverts to while unloaded, never wins.
+		if (bParkPortals)
+		{
+			auto const& Portal = NOSPropertyManager.PortalPinsById.FindChecked(portalId);
+			FPendingPinBinding Binding;
+			Binding.PinId = portalId;
+			Binding.Value = SavedPinValues.FindRef(portalId);
+			Binding.ComponentName = prop->nosMetaDataMap.FindRef(NosMetadataKeys::component);
+			Binding.PropertyPath = prop->nosMetaDataMap.FindRef(NosMetadataKeys::PropertyPath);
+			Binding.ContainerPath = prop->nosMetaDataMap.FindRef(NosMetadataKeys::ContainerPath);
+			Binding.FunctionName = prop->nosMetaDataMap.FindRef(NosMetadataKeys::FunctionName);
+			Binding.FunctionPropertyName = prop->nosMetaDataMap.FindRef(NosMetadataKeys::FunctionPropertyName);
+			Binding.PinShowAs = Portal.ShowAs;
+			Binding.IsPortal = true;
+			PendingPinBindings.FindOrAdd(ParkedUnderActorGuid).Add(MoveTemp(Binding));
+		}
 	}
 	for (auto PropertyId : PropertiesWithPortals)
 	{
@@ -3244,14 +3705,31 @@ void FNOSSceneTreeManager::SendActorNodeDeleted(ActorNode* node)
 
 	if (!PortalsToRemove.IsEmpty())
 	{
-		std::vector<nos::fb::UUID> pinsToDelete;
-		for (auto portalId : PortalsToRemove)
-		{
-			pinsToDelete.push_back(*(nos::fb::UUID*)&portalId);
-		}
 		flatbuffers::FlatBufferBuilder mb;
-		auto offset = nos::CreatePartialNodeUpdateDirect(mb, (nos::fb::UUID*)&FNOSClient::NodeId, nos::ClearFlags::NONE, &pinsToDelete, 0, 0, 0, 0, 0);
-		mb.Finish(offset);
+		if (bParkPortals)
+		{
+			// Orphaned, not deleted. Nodos keeps an orphan pin and everything wired to it,
+			// and greys it out until it comes back - which is what makes a level's pins
+			// survive being streamed out at all. Deleting takes the connections with it.
+			std::vector<flatbuffers::Offset<nos::PartialPinUpdate>> PinUpdates;
+			for (auto portalId : PortalsToRemove)
+			{
+				PinUpdates.push_back(nos::CreatePartialPinUpdate(mb, (nos::fb::UUID*)&portalId, 0,
+					nos::fb::CreatePinOrphanStateDirect(mb, nos::fb::PinOrphanStateType::ORPHAN, "Level is not loaded")));
+			}
+			auto offset = nos::CreatePartialNodeUpdateDirect(mb, (nos::fb::UUID*)&FNOSClient::NodeId, nos::ClearFlags::NONE, 0, 0, 0, 0, 0, 0, 0, &PinUpdates);
+			mb.Finish(offset);
+		}
+		else
+		{
+			std::vector<nos::fb::UUID> pinsToDelete;
+			for (auto portalId : PortalsToRemove)
+			{
+				pinsToDelete.push_back(*(nos::fb::UUID*)&portalId);
+			}
+			auto offset = nos::CreatePartialNodeUpdateDirect(mb, (nos::fb::UUID*)&FNOSClient::NodeId, nos::ClearFlags::NONE, &pinsToDelete, 0, 0, 0, 0, 0);
+			mb.Finish(offset);
+		}
 		auto buf = mb.Release();
 		auto root = flatbuffers::GetRoot<nos::PartialNodeUpdate>(buf.data());
 		NOSClient->AppServiceClient->SendPartialNodeUpdate(*root);
@@ -3307,6 +3785,12 @@ void FNOSSceneTreeManager::SendParentChanged(FGuid Actor, FGuid ParentActor)
 
 void FNOSSceneTreeManager::PopulateAllChildsOfActor(AActor* actor, FNodeUpdateBatch* OptBatch)
 {
+	// Both callers reach this by dereferencing a weak reference held on a child node, so
+	// a streamed-out actor arrives here as null rather than not at all.
+	if (!IsValid(actor))
+	{
+		return;
+	}
 	LOGF("Populating all childs of %s", *actor->GetFName().ToString());
 	FGuid ActorId = actor->GetActorGuid();
 	PopulateAllChildsOfActor(ActorId, OptBatch);
@@ -3446,6 +3930,14 @@ void FNOSSceneTreeManager::HandleWorldChange()
 	LOG("Handling world change.");
 	SceneTree.Clear();
 	NOSTextureShareManager::GetInstance()->Reset();
+
+	// This re-derives every portal against the new world below, deleting the ones it
+	// cannot resolve. Bindings kept for the old world would fight that - resurrecting a
+	// pin this pass has just decided is gone - so they go with the world they came from,
+	// and so do the values that would have been restored with them.
+	PendingPinBindings.Empty();
+	PendingBindingActorsToResolve.Empty();
+	SavedPinValues.Empty();
 
 	TArray<TTuple<PortalSourceContainerInfo, NOSPortal>> Portals;
 	TSet<FGuid> ActorsToRescan;

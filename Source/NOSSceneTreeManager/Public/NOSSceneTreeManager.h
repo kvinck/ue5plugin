@@ -36,6 +36,48 @@ struct FNodeUpdateBatch
 	std::vector<flatbuffers::Offset<nos::app::AppEvent>> Events;
 };
 
+// A pin from a saved graph that has no object to bind to yet.
+//
+// Importing a node is a single pass over a snapshot of the world: OnNOSNodeImported
+// builds the set of actors that exist at that instant, and every saved pin naming an
+// actor outside it is skipped. Nothing ever revisits those pins, so a level streamed
+// in after launch comes back with its nodes intact and none of its connections - the
+// binding was never registered on this side at all.
+//
+// Holding the binding here instead lets it be resolved whenever its actor turns up,
+// however much later that is. The same record is used to park a portal whose level is
+// being streamed out, so an unload and a never-loaded level take the same path back.
+struct FPendingPinBinding
+{
+	// The id the saved graph is wired to. For a portal this is the portal's own id,
+	// which CreatePortal derives again from the source property's id - the two have to
+	// agree or there is nothing on the Nodos side for the new pin to reattach to.
+	FGuid PinId;
+	FString ComponentName;
+	FString PropertyPath;
+	FString ContainerPath;
+	FString DisplayName;
+	FString FunctionName;
+	FString FunctionPropertyName;
+	nos::fb::ShowAs PinShowAs = nos::fb::ShowAs::PROPERTY;
+	bool IsPortal = false;
+	// Owned copies. The import's buffers are freed when it returns, and a parked
+	// portal's property is destroyed with its level.
+	TArray<uint8> Value;
+	TArray<uint8> DefaultValue;
+};
+
+// A binding that found its property. Portal creation is held back until after the
+// node carrying that property has been sent - a portal names its source pin, and
+// Nodos has to have been told about the pin before something points at it.
+struct FResolvedPinBinding
+{
+	TSharedPtr<NOSProperty> Property;
+	nos::fb::ShowAs ShowAs = nos::fb::ShowAs::PROPERTY;
+	bool bWantsPortal = false;
+	bool bValueApplied = false;
+};
+
 //This class holds the list of all properties and pins 
 class NOSSCENETREEMANAGER_API FNOSPropertyManager
 {
@@ -142,6 +184,18 @@ public:
 
 	bool Tick(float dt);
 	bool CheckNewLevels(float dt);
+
+	// Records a saved pin that could not be bound, so it can be bound later.
+	void StashPendingPinBinding(const struct PropUpdate& Update);
+	// Builds an actor and everything under it without telling Nodos yet, collecting the
+	// nodes that would have been sent. Deferring the send is the point: it is what lets
+	// the saved values be applied before Nodos is told anything about these pins.
+	void PopulateActorSubtreeDeferred(TreeNode* Node, TArray<FGuid>& OutNodesToSend);
+	// Binds one saved pin now that its object exists. False leaves it stashed to try
+	// again - an actor can be in the tree a frame before the property it names is.
+	bool ResolvePendingPinBinding(AActor* Actor, FPendingPinBinding const& Binding, FResolvedPinBinding& OutResolved);
+	// Resolves the bindings of every actor that turned up carrying them.
+	void TickPendingPinBindings();
 
 	// Queues every actor the last rescan found, to be populated over the coming
 	// frames rather than when something first asks for one.
@@ -393,6 +447,23 @@ public:
 	// Set once, at the first transition to synced. Nothing is populated before it:
 	// building during startup delays the very handshake that sets it.
 	bool bHasGoneLive = false;
+
+	// Saved pins waiting for their actor, keyed by the actor guid they name. Filled by
+	// an import that could not resolve them, and by a level being streamed out.
+	TMap<FGuid, TArray<FPendingPinBinding>> PendingPinBindings;
+	// What the imported graph says each pin is worth, kept for the life of the import and
+	// keyed by saved pin id. A level that streams out and back is expected to come back
+	// reading what the graph holds rather than what the level was authored with, and the
+	// property it names is destroyed in between - so the value has to be held here rather
+	// than read back off the object at reload.
+	TMap<FGuid, TArray<uint8>> SavedPinValues;
+	// Actors that have appeared carrying pending bindings. Resolved from the tick
+	// rather than on the spot, so the node is in the tree before anything looks for it.
+	TArray<FGuid> PendingBindingActorsToResolve;
+	// Set while a streaming level is being removed from the world. An actor destroyed
+	// inside this window is expected back, so its portals are parked as orphans rather
+	// than deleted - deleting them takes every connection Nodos holds with them.
+	bool bUnloadingLevel = false;
 
 	static TSet<FGuid> PropertiesNeeded;
 
