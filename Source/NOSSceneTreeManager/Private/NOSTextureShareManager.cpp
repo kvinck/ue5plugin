@@ -5,7 +5,6 @@
 #include "HardwareInfo.h"
 #include "Misc/ScopeExit.h"
 #include "NOSSceneTreeManager.h"   // for LogNOSSceneTreeManager
-#include "Misc/ScopeExit.h"
 
 #pragma warning (disable : 4800)
 #pragma warning (disable : 4668)

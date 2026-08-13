@@ -459,8 +459,17 @@ public:
 	TSet<FGuid> QueuedForPopulate;
 	int32 BackgroundPopulateQueued = 0;
 	double BackgroundPopulateStartedAt = 0.0;
-	// Set once, at the first transition to synced. Nothing is populated before it:
-	// building during startup delays the very handshake that sets it.
+	// Set once, at the first transition to synced. A latch, not a mirror of the
+	// execution state: an idle switch later in the show does not put us back into
+	// startup.
+	//
+	// Read only by TickPendingLevelRequests, which holds a loaded graph's level
+	// changes until the app is up. Background population deliberately does NOT wait
+	// on this - it did once, and holding the tree back until synced put it behind the
+	// pass in which Nodos assigns every pin its ShowAs. Pins that miss that pass stay
+	// PROPERTY forever, ProcessCopies only touches INPUT_PIN and OUTPUT_PIN, and every
+	// texture input on the show rendered black for the life of the session. See the
+	// comment above CVarBackgroundPopulate before wiring this to anything else.
 	bool bHasGoneLive = false;
 
 	// Saved pins waiting for their actor, keyed by the actor guid they name. Filled by

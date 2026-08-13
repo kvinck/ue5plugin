@@ -734,7 +734,6 @@ void FNOSSceneTreeManager::TickBackgroundPopulate()
 		NOSClient->AppServiceClient->Send(*root);
 	};
 
-	int32 Built = 0;
 	while (!ActorsToBePopulated.IsEmpty() && HasTimeLeft())
 	{
 		FNodeUpdateBatch Batch;
@@ -749,7 +748,6 @@ void FNOSSceneTreeManager::TickBackgroundPopulate()
 			if (auto* Node = SceneTree.GetNode(NodeId))
 			{
 				PopulateNodeAndDirectDescendants(Node, &Batch);
-				Built++;
 			}
 		}
 		Flush(Batch);
@@ -762,7 +760,6 @@ void FNOSSceneTreeManager::TickBackgroundPopulate()
 			BackgroundPopulateQueued, FPlatformTime::Seconds() - BackgroundPopulateStartedAt);
 		BackgroundPopulateQueued = 0;
 	}
-	(void)Built;
 }
 
 bool FNOSSceneTreeManager::CheckNewLevels(float dt)
@@ -2293,13 +2290,6 @@ void FNOSSceneTreeManager::OnNOSNodeImported(nos::fb::Node const& appNode)
 	LOG("Node from Nodos successfully imported");
 }
 
-// The name the pin is built from, and the one shown on it. The package name is what makes
-// the pin id stable across sessions; the short name is what an operator reads.
-static FString GetLevelPackageString(ULevelStreaming* Level)
-{
-	return Level ? Level->GetWorldAssetPackageFName().ToString() : FString();
-}
-
 TArray<ULevelStreaming*> FNOSSceneTreeManager::GetStreamingLevels() const
 {
 	TArray<ULevelStreaming*> Levels;
@@ -2663,30 +2653,6 @@ bool FNOSSceneTreeManager::ResolvePendingPinBinding(AActor* Actor, FPendingPinBi
 	return true;
 }
 
-// Whether to also push the value at Nodos after binding, on top of the node update that
-// already carries it.
-//
-// Redundant in the ordinary case: the node update is held back until the values are
-// applied, so the first thing Nodos hears about one of these pins already reads
-// correctly. It earns its place in the case where nothing was built - an actor the
-// background queue or a LoadNodesOnPaths request reached before this pass, so
-// PopulateNode returns false and no node update is sent. There Nodos is still holding
-// whatever it was told when the actor was populated, and this is the only thing that
-// corrects it.
-//
-// It was briefly suspected of making a reconnected pin inert - right value, would not
-// take an edit, reverted on reselect - because turning it off and sending the
-// orphan-state activation below went in together. Retested with it back on: the pin
-// stays correct and editable, so the activation was the fix and this is harmless. Kept
-// as a switch rather than removed, like the rest of the knobs in this file, so it can be
-// ruled out from the console mid-show instead of by a rebuild.
-static TAutoConsoleVariable<int32> CVarNotifyReconnectedPinValue(
-	TEXT("Nodos.NotifyReconnectedPinValue"),
-	1,
-	TEXT("Send a pin value notification after reconnecting a saved pin, in addition to the ")
-	TEXT("node update that already carries the value. 0 disables it; the value then relies ")
-	TEXT("on the node update alone, which is not sent for an already-populated actor."));
-
 void FNOSSceneTreeManager::TickPendingPinBindings()
 {
 	if (PendingBindingActorsToResolve.IsEmpty())
@@ -2773,7 +2739,15 @@ void FNOSSceneTreeManager::TickPendingPinBindings()
 			{
 				continue;
 			}
-			if (ResolvedBinding.bValueApplied && CVarNotifyReconnectedPinValue.GetValueOnGameThread())
+			// On top of the node update that already carries the value. Redundant in the
+			// ordinary case - the node update is held back until the values are applied,
+			// so the first thing Nodos hears about one of these pins already reads
+			// correctly. It earns its place when nothing was built: an actor the
+			// background queue or a LoadNodesOnPaths request reached before this pass
+			// makes PopulateNode return false, no node update is sent, and Nodos is still
+			// holding whatever it was told when the actor was populated. This is the only
+			// thing that corrects it.
+			if (ResolvedBinding.bValueApplied)
 			{
 				SendPinValueChanged(ResolvedBinding.Property->Id, ResolvedBinding.Property->data);
 			}
