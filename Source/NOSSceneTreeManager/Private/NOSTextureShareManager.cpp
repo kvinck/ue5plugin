@@ -4,6 +4,8 @@
 
 #include "HardwareInfo.h"
 #include "Misc/ScopeExit.h"
+#include "NOSSceneTreeManager.h"   // for LogNOSSceneTreeManager
+#include "Misc/ScopeExit.h"
 
 #pragma warning (disable : 4800)
 #pragma warning (disable : 4668)
@@ -100,8 +102,22 @@ UTextureRenderTarget2D* GetPropertyRenderTarget(NOSProperty* nosprop)
 }
 
 
+// Creating the shared destination costs a FlushRenderingCommands below, which blocks the game
+// thread until the render thread has drained - the single most expensive thing this plugin can
+// do inside a frame, and it happens on the first interaction with a pin rather than at load.
+// It is rare enough to log unconditionally, and when a frame goes long around an operator
+// action this is the first line worth looking for.
 std::optional<std::pair<TSharedPtr<SharedResourceInfo>, nos::sys::vulkan::TTexture>> TryCreateDestinationForRT(ID3D12Device& device, UTextureRenderTarget2D& sourceRT, FString const& destName)
 {
+	const double CreateStartTime = FPlatformTime::Seconds();
+	ON_SCOPE_EXIT
+	{
+		UE_LOG(LogNOSSceneTreeManager, Display,
+			TEXT("Created a shared texture for '%s' (%dx%d) in %.1f ms on the game thread"),
+			*destName, sourceRT.SizeX, sourceRT.SizeY,
+			(FPlatformTime::Seconds() - CreateStartTime) * 1000.0);
+	};
+
 	auto info = ConvertRenderTargetToNosTextureInfo(sourceRT);
 
 	auto newRTName = destName + FGuid::NewGuid().ToString();
@@ -175,6 +191,25 @@ NOSTextureShareManager::~NOSTextureShareManager()
 nos::sys::vulkan::TTexture NOSTextureShareManager::AddTexturePin(NOSProperty* nosprop)
 {
 	auto& texPropInfo = *TextureProperties.Add(nosprop, MakeShared<TexturePropertyInfo>(nosprop->PinShowAs));
+
+	// ShowAs is snapshotted here, at registration, and ProcessCopies only ever touches
+	// INPUT_PIN and OUTPUT_PIN - so this line says whether anything will ever be copied into
+	// this pin at all. A pin registered as a plain property is one that reached Nodos after it
+	// had finished assigning, and it will render black for the life of the session. Logged per
+	// pin rather than as a summary because a summary is taken at one instant and pins are
+	// registered across many.
+	{
+		const TCHAR* ShowAsName = TEXT("plain property - never copied");
+		switch (nosprop->PinShowAs)
+		{
+		case nos::fb::ShowAs::INPUT_PIN:  ShowAsName = TEXT("input"); break;
+		case nos::fb::ShowAs::OUTPUT_PIN: ShowAsName = TEXT("output"); break;
+		default: break;
+		}
+		UE_LOG(LogNOSSceneTreeManager, Display, TEXT("Registered texture pin '%s' as %s"),
+			*nosprop->DisplayName, ShowAsName);
+	}
+
 	auto propRT = GetPropertyRenderTarget(nosprop);
 	nosprop->IsOrphan = true;
 	if (!propRT)
@@ -435,6 +470,8 @@ void NOSTextureShareManager::OnEndFrame()
 	// resolution change across a set of pins used to queue one full stall per pin, all in this
 	// one frame.
 	bool bFlushed = false;
+	double FlushStartTime = 0.0;
+	int32 Retired = 0;
 	while(!ResourcesToDelete.IsEmpty())
 	{
 		auto* resource = ResourcesToDelete.Peek();
@@ -442,15 +479,26 @@ void NOSTextureShareManager::OnEndFrame()
 		{
 			if (!bFlushed)
 			{
+				FlushStartTime = FPlatformTime::Seconds();
 				FlushRenderingCommands();
 				bFlushed = true;
 			}
 			ResourcesToDelete.Pop();
+			Retired++;
 		}
 		else
 		{
 			break;
 		}
+	}
+	// The other half of a shared texture's cost, landing five frames after the one that
+	// created it. Logged for the same reason: it is a whole-frame stall that nothing else
+	// accounts for.
+	if (bFlushed)
+	{
+		UE_LOG(LogNOSSceneTreeManager, Display,
+			TEXT("Retired %d shared texture(s) in %.1f ms on the game thread"),
+			Retired, (FPlatformTime::Seconds() - FlushStartTime) * 1000.0);
 	}
 	// ENQUEUE_RENDER_COMMAND(FNOSClient_CopyOnTick)(
 	// 	[this, FrameCount = GFrameCounter](FRHICommandListImmediate& RHICmdList)

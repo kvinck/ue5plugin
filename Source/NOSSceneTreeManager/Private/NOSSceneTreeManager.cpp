@@ -21,6 +21,7 @@
 #include "PacketHandler.h"
 #include "Editor.h"
 #include "Misc/MessageDialog.h"
+#include "Misc/ScopeExit.h"
 #include "Engine/LevelStreaming.h"
 #include "Engine/Blueprint.h"
 #include "Blueprint/UserWidget.h"
@@ -498,8 +499,44 @@ void FNOSSceneTreeManager::ShutdownModule()
 	LOG("NOSSceneTreeManager module successfully shut down.");
 }
 
+// A long frame leaves no trace of its own. Everything this plugin can do inside one is
+// timed, but the expensive thing is often somewhere else entirely - a blueprint, a level
+// activating, a shader compiling - and then the only evidence is a gap between two
+// unrelated log lines whose frame numbers happen to be far apart. That gap is readable
+// only when something else logged on both sides of it, which on a quiet renderer it does
+// not: chasing an on-air hitch, the interaction that caused it was the last line in the
+// file and the frame it landed in could not be measured at all.
+//
+// So have the frame say so itself, timed off the wall clock. Not off this tick's dt: a
+// genlocked renderer runs a fixed timestep, so the delta the engine hands out stays pinned
+// at a frame's worth however long the frame actually took. Measured that way this sat
+// silent through a frame the log shows taking 1.85 seconds.
+static TAutoConsoleVariable<float> CVarLogSlowFrameMs(
+	TEXT("Nodos.LogSlowFrameMs"), 33.0f,
+	TEXT("Log any frame that takes longer than this many milliseconds, with its frame number. ")
+	TEXT("0 disables. Default is two frames' worth at 60 fps."));
+
+// Kept beside the cvar rather than on the manager: it is only ever read and written by the
+// tick below, and the manager's state is about the scene tree, not about instrumentation.
+static double LastTickSeconds = 0.0;
+
 bool FNOSSceneTreeManager::Tick(float dt)
 {
+	const double Now = FPlatformTime::Seconds();
+	const double PreviousTickSeconds = LastTickSeconds;
+	LastTickSeconds = Now;
+
+	const float SlowFrameMs = CVarLogSlowFrameMs.GetValueOnGameThread();
+	if (SlowFrameMs > 0.0f && PreviousTickSeconds > 0.0)
+	{
+		const double FrameMs = (Now - PreviousTickSeconds) * 1000.0;
+		if (FrameMs >= SlowFrameMs)
+		{
+			UE_LOG(LogNOSSceneTreeManager, Display, TEXT("Frame %llu took %.1f ms"),
+				(uint64)GFrameCounter, FrameMs);
+		}
+	}
+
 	if (bTwoWayBindingEnabled && !bTwoWayBindingStatusSent)
 	{
 		nos::fb::TNodeStatusMessage TwoWayBindingStatus;
@@ -534,17 +571,28 @@ bool FNOSSceneTreeManager::Tick(float dt)
 // A trickle, and it has to stay a trickle. Going faster looks like it should
 // only move the same work earlier, and it does not - it changes what Nodos has
 // to do. Nodos resolves its graph once, early, against whatever the app has
-// given it by then. Left alone it syncs a couple of seconds after the scan,
-// having been handed only the hundred-odd nodes it actually asked for, and the
-// rest of the tree arrives behind it as small updates that cost nothing. Empty
-// the queue at a hundred milliseconds a frame instead and the whole tree - some
-// eighty-eight thousand pins - lands before that resolution runs, so it runs
-// against all of it: every one of those pins takes a ShowAs assignment, and the
-// app waits three and a half minutes to go live instead of two seconds.
+// given it by then, and every pin present for that pass takes a ShowAs
+// assignment. Emptying the queue at a hundred milliseconds a frame put the whole
+// tree in front of that pass and pushed going live out to minutes.
 //
-// So the budget below is not politeness to the render thread. It is what keeps
-// the tree from arriving before Nodos is ready to be told about it. Raising it
-// makes loading slower, not faster.
+// So the budget below is not politeness to the render thread. It paces how fast
+// the tree reaches Nodos. Raising it makes loading slower, not faster.
+//
+// What the budget must NOT become is a wait. This used to hold the queue until
+// the app had gone synced, which kept the tree out of that resolution pass
+// entirely - and a pin that misses the pass never gets a ShowAs at all. It stays
+// PROPERTY, ProcessCopies only ever touches INPUT_PIN and OUTPUT_PIN, and so
+// nothing is ever copied into it: every texture input on this show rendered
+// black and stayed black, colour feeds and video alike, silently and for the
+// life of the session. The assignment is not a cost to be avoided. It is what
+// makes an input pin an input pin.
+//
+// Measured on this show, same build, 44 actors and 5785 pins: holding until
+// synced reaches synced in 13.6 s, draining immediately reaches it in 16.8 s.
+// Three seconds, for every texture pin in the scene. The minutes the hold was
+// written against came from a scene of 35,680 pins, and reducing that - which is
+// what "Expose only what a show drives" did - is the fix that does not break
+// anything. Reduce the pin count; never delay the population.
 //
 // The draining also belongs here, in the tick, after the rescan has sent its
 // root update. That update carries CLEAR_NODES, so Nodos drops and rebuilds
@@ -566,17 +614,6 @@ static TAutoConsoleVariable<float> CVarBackgroundPopulateMs(
 	3.0f,
 	TEXT("Milliseconds per frame to spend building actors in the background. Raising this ")
 	TEXT("delays the app going live - see the comment above; it does not speed loading up."));
-
-// How long to wait for the app to go synced before building anyway. Only a
-// backstop - normally going synced arrives a second or two after the scan and
-// ends the wait long before this. It exists so a session that never syncs still
-// gets its actors built rather than silently falling back to building on first
-// touch.
-static TAutoConsoleVariable<float> CVarBackgroundPopulateHoldForSyncSeconds(
-	TEXT("Nodos.BackgroundPopulateHoldForSyncSeconds"),
-	60.0f,
-	TEXT("Seconds to hold background population waiting for the app to go synced. ")
-	TEXT("0 builds immediately, which delays going synced - see the comment above."));
 
 // Actors per outgoing message while draining. The batch exists to keep one
 // message per frame in the metered case; during an unbounded drain it also
@@ -671,32 +708,10 @@ void FNOSSceneTreeManager::TickBackgroundPopulate()
 	if (!NOSClient || !NOSClient->IsConnected())
 		return;
 
-	// And nothing is built until the app has been live once.
-	//
-	// Between connecting and going synced, Nodos is resolving its graph and
-	// deciding when to take the app live, and it will not do that while the app
-	// keeps handing it more tree. Feeding the queue through that window pushes
-	// going synced from two seconds after the scan out to fifty, and the whole
-	// load from 55 seconds to 107 - measured, and confirmed by turning population
-	// off entirely, which gives the 55 seconds back. Note that what is sent is
-	// identical either way, down to the pin; only the rate differs. Trickling it
-	// slowly enough to leave gaps happens to work and is what the old build did
-	// by accident, but it is a race, and this is the same thing won on purpose.
-	//
-	// Waiting costs nothing. Nothing can hitch before there is an air to hitch on,
-	// and the queue drains in the seconds after going live - long before an
-	// operator can reach for anything.
-	if (!bHasGoneLive)
-	{
-		// Backstop for a session that never goes synced at all: an editor session,
-		// or a renderer that comes up without Nodos taking it live. Without this the
-		// queue would sit forever and every actor would go back to being built on
-		// first touch, which is the thing this exists to prevent.
-		const double HoldSeconds = FMath::Max(0.0, static_cast<double>(
-			CVarBackgroundPopulateHoldForSyncSeconds.GetValueOnGameThread()));
-		if (FPlatformTime::Seconds() - BackgroundPopulateStartedAt < HoldSeconds)
-			return;
-	}
+	// Deliberately no wait for the app to go live here. Draining starts as soon as
+	// there is somewhere to send to, so the tree is in front of Nodos while it is
+	// still assigning ShowAs - see the comment above the budget, and do not put the
+	// wait back without reading it.
 
 	const double Budget = CVarBackgroundPopulateMs.GetValueOnGameThread() / 1000.0;
 	const double StartedAt = FPlatformTime::Seconds();
@@ -935,8 +950,30 @@ void FNOSSceneTreeManager::OnNOSPinShowAsChanged(nos::fb::UUID const& Id, nos::f
 	}
 }
 
+// A function call from Nodos runs the show's own blueprint inline on the game thread, and
+// an operator action that hitches usually goes through here. Nothing said how long it took
+// or which function it was, so a frame lost to a blueprint looked identical to a frame lost
+// to the plugin.
+static TAutoConsoleVariable<float> CVarLogSlowFunctionCallMs(
+	TEXT("Nodos.LogSlowFunctionCallMs"), 8.0f,
+	TEXT("Log any function call from Nodos that holds the game thread for longer than this, ")
+	TEXT("with the name of the function that did it. 0 logs every call."));
+
 void FNOSSceneTreeManager::OnNOSFunctionCalled(nos::app::FunctionCall const& functionCall)
 {
+	const double FunctionCallStartTime = FPlatformTime::Seconds();
+	FString CalledFunctionName = TEXT("<unregistered>");
+	ON_SCOPE_EXIT
+	{
+		const double ElapsedMs = (FPlatformTime::Seconds() - FunctionCallStartTime) * 1000.0;
+		if (ElapsedMs >= CVarLogSlowFunctionCallMs.GetValueOnGameThread())
+		{
+			UE_LOG(LogNOSSceneTreeManager, Display,
+				TEXT("Function '%s' called from Nodos held the game thread for %.1f ms"),
+				*CalledFunctionName, ElapsedMs);
+		}
+	};
+
 	FGuid funcId = *(FGuid*)functionCall.function_id();
 	TMap<FGuid, std::vector<uint8>> properties;
 	if (auto* pinVals = functionCall.pin_values())
@@ -951,11 +988,13 @@ void FNOSSceneTreeManager::OnNOSFunctionCalled(nos::app::FunctionCall const& fun
 	if (CustomFunctions.Contains(funcId))
 	{
 		auto noscf = CustomFunctions.FindRef(funcId);
+		CalledFunctionName = TEXT("<custom function>");
 		noscf->Function(properties);
 	}
 	else if (RegisteredFunctions.Contains(funcId))
 	{
 		auto nosfunc = RegisteredFunctions.FindRef(funcId);
+		CalledFunctionName = nosfunc->DisplayName.IsEmpty() ? nosfunc->FunctionName : nosfunc->DisplayName;
 		uint8* Parms = (uint8*)FMemory_Alloca_Aligned(nosfunc->Function->ParmsSize, nosfunc->Function->GetMinAlignment());
 		nosfunc->Parameters = Parms;
 		FMemory::Memzero(Parms, nosfunc->Function->ParmsSize);
